@@ -1,0 +1,6 @@
+framework module WeChatIntercept {
+  umbrella header "WeChatIntercept.h"
+
+  export *
+  module * { export * }
+}
