@@ -19,7 +19,6 @@ app_bundle_path="${WeChat_path}/Contents/MacOS"
 app_executable_path="${app_bundle_path}/${app_name}"
 app_executable_backup_path="${app_executable_path}_backup"
 framework_path="${shell_path}/${framework_name}.framework"
-echo framework_path-----$framework_path
 if [ ! -w "$WeChat_path" ]
 then
     echo -e "为了将ZY助手写入微信, 请输入密码 ： "
