@@ -1,7 +1,7 @@
 # WeChatIntercept
 微信防撤回插件，一键安装，仅MAC可用
 
-安装方法：将Install.sh文件拖到终端，回车输入密码，然后重启微信即可。
+安装方法：cd到WeChatIntercept文件夹，将Install.sh文件拖到终端，回车输入密码，然后重启微信即可。
 
 卸载方法：将Uninstall.sh文件拖到终端，然后回车。
 
