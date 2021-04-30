@@ -6,16 +6,23 @@
 	<dict>
 		<key>Resources/Info.plist</key>
 		<data>
-		mey6px5mp8PjGmPsL+SOGZa7npg=
+		5d8irGmxvBHhHhx92OavmkYU9K0=
 		</data>
 	</dict>
 	<key>files2</key>
 	<dict>
+		<key>Modules/module.modulemap</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			CUcx6gRmMiQBxlRe4LngVyJHd9JTB1ms1fe/m2nELzg=
+			</data>
+		</dict>
 		<key>Resources/Info.plist</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			s0FqUY9dc1TbTfIa8fDbccXwAHFmaw+poF2CslFltUs=
+			VnExFrS7a+ZcoTX+QggnDkan12+MRI52qJgoNMfZG4g=
 			</data>
 		</dict>
 	</dict>
