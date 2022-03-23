@@ -6,7 +6,11 @@
 	<dict>
 		<key>Resources/Info.plist</key>
 		<data>
-		43PmyKw1jIq+9OBI5DgxlECyzsw=
+		YxXfHTUApnVRGuKQ4seD8aLoaqM=
+		</data>
+		<key>Resources/ZYCustomPrefixVC.nib</key>
+		<data>
+		3nucXt97sY/aQuaoTyvJNJ+UV2c=
 		</data>
 	</dict>
 	<key>files2</key>
@@ -22,7 +26,14 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			5iFgo3KhThkBKQytTrT+4R8bgMHxiZF297YV66qYE2Q=
+			ZcSKYXEv9ASQagQkhZtKEHIzWRVQoGez7J+IHNFCgro=
+			</data>
+		</dict>
+		<key>Resources/ZYCustomPrefixVC.nib</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			2COV6Pu/VOO4yZ5l5VFjHzhFxGo+5XpmiL4TZlJVcyw=
 			</data>
 		</dict>
 	</dict>
