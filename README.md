@@ -27,10 +27,10 @@
 
 2.如果系统提示遇到截屏无法使用，已添加微信的屏幕录制权限仍然不行
 
-在私隐中，删除掉WeChat/微信，然后重新添加进来，重启WeChat/微信，就可以正常截图
+在系统安全性与隐私处中删除掉WeChat/微信，然后重新添加进来，重启WeChat/微信，就可以正常截图（感谢[Kylelkh](https://github.com/Kylelkh)）
 
 3.M1芯片怎么使用
 
-其他开发者提供使用方案：安装Rosetta软件，然后在属性里勾选使用Rosetta打开微信就可以了
+安装Rosetta软件，然后在属性里勾选使用Rosetta打开微信就可以了（感谢[Mercury2699](https://github.com/Mercury2699)、[bolosea](https://github.com/bolosea)）
 
 
