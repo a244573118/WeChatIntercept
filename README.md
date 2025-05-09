@@ -1,4 +1,7 @@
 # WeChatIntercept
+### 微信v3.7.0下载
+当前无时间更新插件，大家可下载[微信v3.7.0版本](https://dldir1.qq.com/weixin/mac/WeChatMac.dmg)使用
+
 ### 微信防撤回插件，一键安装，仅MAC可用。
 
 1.支持最新版微信3.7.0防撤回；
