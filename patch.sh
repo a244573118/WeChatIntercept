@@ -1,170 +1,64 @@
 #!/bin/bash
 #
 # ============================================================
-# 微信防撤回一键 Patch 脚本
+# 微信防撤回一键安装脚本
 # ============================================================
 #
 # 适用版本: 微信 4.1.9 (CFBundleVersion: 268602)
 # 适用平台: macOS (Apple Silicon + Intel)
-# 依赖工具: python3, codesign, tar (macOS 系统自带)
+# 依赖工具: clang, codesign, python3 (macOS 系统自带)
 #
 # 使用方法:
-#   chmod +x patch.sh        # 首次使用需添加执行权限
-#   ./patch.sh               # 应用防撤回补丁
-#   ./patch.sh --restore     # 恢复原始微信（撤销补丁）
-#   ./patch.sh --status      # 查看当前补丁状态
+#   chmod +x install.sh
+#   ./install.sh            # 安装防撤回
+#   ./install.sh --uninstall # 卸载（恢复原始微信）
 #
 # 原理:
-#   修改 wechat.dylib 中的 isRevokeMessage() 函数，
-#   使其始终返回 false，微信将不再识别撤回通知，
-#   消息保持可见。不影响自己主动撤回消息。
-#
-# 注意:
-#   - 微信更新后需要重新运行此脚本
-#   - 首次运行可能需要约 30 秒（解除系统保护）
-#   - 同时 patch arm64 和 x86_64，Apple Silicon 和 Intel Mac 通用
+#   通过 DYLD 注入一个运行时 hook 动态库，
+#   拦截微信的 isRevokeMessage() 函数，
+#   区分对方撤回和自己撤回：
+#   - 对方撤回 → 返回 false（消息保留不被删除）
+#   - 自己撤回 → 返回 true（正常处理，不会闪退）
 #
 # ============================================================
 
 set -e
 
-# ======================== 配置 ========================
 WECHAT_APP="/Applications/WeChat.app"
-DYLIB_PATH="$WECHAT_APP/Contents/Resources/wechat.dylib"
-BACKUP_DIR="$HOME/.wechat_patch_backup"
+WECHAT_BIN="$WECHAT_APP/Contents/MacOS/WeChat"
+DYLIB_DST="$WECHAT_APP/Contents/Resources/WeChatAntiRevoke.dylib"
+DYLIB_INSTALL_NAME="@executable_path/../Resources/WeChatAntiRevoke.dylib"
 EXPECTED_VERSION="268602"
-EXPECTED_VERSION_STR="4.1.9"
-
-# arm64 patch 参数
-ARM64_SLICE_OFFSET="0x9B18000"
-ARM64_PATCH_VA="0x44E3D50"
-ARM64_PATCH_HEX="00008052C0035FD6"       # MOV W0, #0; RET (8 bytes)
-ARM64_ORIGINAL_MASK="9F000000"            # ADRP 指令掩码
-ARM64_ORIGINAL_EXPECT="90000000"          # ADRP 指令特征
-ARM64_PATCH_LEN=8
-
-# x86_64 patch 参数
-X86_SLICE_OFFSET="0x4000"
-X86_PATCH_VA="0x4AF08D0"
-X86_PATCH_HEX="31C0C3"                   # XOR EAX, EAX; RET (3 bytes)
-X86_ORIGINAL_HEX="488B05"                # MOV RAX, [RIP+...] 前3字节
-X86_PATCH_LEN=3
-# =====================================================
 
 print_banner() {
     echo ""
     echo "=============================="
-    echo " 微信防撤回 Patch 工具"
-    echo " 适用: macOS / 微信 $EXPECTED_VERSION_STR"
+    echo " 微信防撤回安装工具"
+    echo " 适用: macOS / 微信 4.1.9"
     echo " 支持: Apple Silicon + Intel"
     echo "=============================="
     echo ""
 }
 
-print_usage() {
-    echo "用法:"
-    echo "  $0              应用防撤回补丁"
-    echo "  $0 --restore    恢复原始微信"
-    echo "  $0 --status     查看补丁状态"
-    echo "  $0 --help       显示帮助"
-}
-
-# 检查基本环境
 check_environment() {
-    # 检查 python3
-    if ! command -v python3 &>/dev/null; then
-        echo "[ERROR] 未找到 python3，请安装 Xcode Command Line Tools:"
-        echo "        xcode-select --install"
-        exit 1
-    fi
-
-    # 检查微信是否存在
     if [ ! -d "$WECHAT_APP" ]; then
         echo "[ERROR] 未找到微信: $WECHAT_APP"
         exit 1
     fi
 
-    # 检查版本
     VERSION=$(defaults read "$WECHAT_APP/Contents/Info.plist" CFBundleVersion 2>/dev/null)
     if [ "$VERSION" != "$EXPECTED_VERSION" ]; then
-        echo "[ERROR] 微信版本不匹配"
-        echo "        期望: $EXPECTED_VERSION ($EXPECTED_VERSION_STR)"
-        echo "        实际: $VERSION"
-        echo ""
-        echo "        此脚本仅适用于微信 $EXPECTED_VERSION_STR 版本。"
-        echo "        请确认你的微信版本，或联系脚本提供者获取对应版本的补丁。"
+        echo "[ERROR] 微信版本不匹配 (期望 $EXPECTED_VERSION, 实际 $VERSION)"
         exit 1
     fi
 
-    # 检查 wechat.dylib
-    if [ ! -f "$DYLIB_PATH" ]; then
-        echo "[ERROR] 未找到核心文件: $DYLIB_PATH"
-        echo "        微信安装可能不完整，请重新安装微信后再试。"
+    if ! command -v clang &>/dev/null; then
+        echo "[ERROR] 未找到 clang，请安装 Xcode Command Line Tools:"
+        echo "        xcode-select --install"
         exit 1
     fi
 }
 
-# 获取当前 patch 状态 (同时检查两个架构)
-get_patch_status() {
-    python3 -c "
-import struct
-
-dylib = '$DYLIB_PATH'
-arm64_off = $ARM64_SLICE_OFFSET + $ARM64_PATCH_VA
-x86_off = $X86_SLICE_OFFSET + $X86_PATCH_VA
-
-with open(dylib, 'rb') as f:
-    # 检查 arm64
-    f.seek(arm64_off)
-    arm64_bytes = f.read($ARM64_PATCH_LEN)
-    arm64_patched = (arm64_bytes == bytes.fromhex('$ARM64_PATCH_HEX'))
-
-    # 检查 x86_64
-    f.seek(x86_off)
-    x86_bytes = f.read($X86_PATCH_LEN)
-    x86_patched = (x86_bytes == bytes.fromhex('$X86_PATCH_HEX'))
-
-if arm64_patched and x86_patched:
-    print('patched')
-elif not arm64_patched and not x86_patched:
-    # 验证是否是原始字节
-    insn = struct.unpack_from('<I', arm64_bytes, 0)[0]
-    arm64_ok = (insn & 0x$ARM64_ORIGINAL_MASK) == 0x$ARM64_ORIGINAL_EXPECT
-    x86_ok = (x86_bytes == bytes.fromhex('$X86_ORIGINAL_HEX'))
-    if arm64_ok and x86_ok:
-        print('original')
-    else:
-        print('unknown')
-elif arm64_patched or x86_patched:
-    print('partial')
-else:
-    print('unknown')
-" 2>/dev/null
-}
-
-# 保存原始字节用于恢复
-save_original_bytes() {
-    mkdir -p "$BACKUP_DIR"
-    python3 -c "
-dylib = '$DYLIB_PATH'
-arm64_off = $ARM64_SLICE_OFFSET + $ARM64_PATCH_VA
-x86_off = $X86_SLICE_OFFSET + $X86_PATCH_VA
-
-with open(dylib, 'rb') as f:
-    f.seek(arm64_off)
-    arm64_orig = f.read($ARM64_PATCH_LEN)
-    f.seek(x86_off)
-    x86_orig = f.read($X86_PATCH_LEN)
-
-with open('$BACKUP_DIR/arm64.bytes', 'wb') as f:
-    f.write(arm64_orig)
-with open('$BACKUP_DIR/x86_64.bytes', 'wb') as f:
-    f.write(x86_orig)
-print('saved')
-" 2>/dev/null
-}
-
-# 关闭微信
 kill_wechat() {
     if pgrep -x WeChat >/dev/null 2>&1; then
         echo "[INFO] 关闭微信..."
@@ -173,252 +67,259 @@ kill_wechat() {
     fi
 }
 
-# 解除 provenance 保护
 remove_provenance() {
-    echo "[INFO] 检测到系统保护，正在解除..."
-    echo "[INFO] 重建 WeChat.app 中（约 30 秒）..."
-
+    echo "[INFO] 解除系统文件保护（约 30 秒）..."
     TMP_DIR=$(mktemp -d)
     tar --no-xattrs -cf - -C /Applications WeChat.app | tar -xf - -C "$TMP_DIR/"
     rm -rf "$WECHAT_APP"
     mv "$TMP_DIR/WeChat.app" "$WECHAT_APP"
     rm -rf "$TMP_DIR"
-
-    echo "[INFO] 系统保护已解除"
+    echo "[INFO] 保护已解除"
 }
 
-# 写入 patch 字节 (同时 patch 两个架构)
-write_patch() {
-    python3 -c "
+compile_dylib() {
+    echo "[INFO] 编译 hook 动态库..."
+
+    # 内嵌 hook.m 源码
+    local SRC_FILE=$(mktemp /tmp/hook_XXXXXX.m)
+    cat > "$SRC_FILE" << 'HOOK_SOURCE'
+#import <Foundation/Foundation.h>
+#import <mach-o/dyld.h>
+#import <mach/mach.h>
+#import <sys/mman.h>
+#import <stdint.h>
+
+static const uintptr_t kSlotVA = 0x9301838;
+static const char *kDylibSuffix = "Resources/wechat.dylib";
+static const int kMsgTypeOffset = 0x0C;
+static const int kRevokeType = 0x2712;
+
+static _Bool hook_isRevokeMessage(void *msg) {
+    if (msg == NULL) return 0;
+    int32_t msgType = *(int32_t *)((uint8_t *)msg + kMsgTypeOffset);
+    if (msgType != kRevokeType) return 0;
+    uint32_t field18 = *(uint32_t *)((uint8_t *)msg + 0x18);
+    if (field18 == 0x64697877) return 0; // "wxid" = 对方撤回 → 阻止
+    return 1; // 自己撤回 → 放行
+}
+
+static uintptr_t find_wechat_slide(void) {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name == NULL) continue;
+        size_t len = strlen(name);
+        size_t suffixLen = strlen(kDylibSuffix);
+        if (len >= suffixLen && strcmp(name + len - suffixLen, kDylibSuffix) == 0)
+            return (uintptr_t)_dyld_get_image_vmaddr_slide(i);
+    }
+    return 0;
+}
+
+__attribute__((constructor))
+static void hook_init(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        uintptr_t slide = find_wechat_slide();
+        if (slide == 0) return;
+        void **slot = (void **)(slide + kSlotVA);
+        uintptr_t page = (uintptr_t)slot & ~0x3FFF;
+        vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, 0, VM_PROT_READ | VM_PROT_WRITE);
+        *slot = (void *)&hook_isRevokeMessage;
+    });
+}
+HOOK_SOURCE
+
+    clang -arch arm64 -arch x86_64 -shared -framework Foundation \
+        -o "$DYLIB_DST" \
+        -install_name "$DYLIB_INSTALL_NAME" \
+        "$SRC_FILE" 2>&1
+
+    rm -f "$SRC_FILE"
+
+    if [ ! -f "$DYLIB_DST" ]; then
+        echo "[ERROR] 编译失败"
+        exit 1
+    fi
+    echo "[INFO] 编译成功"
+}
+
+inject_dylib() {
+    echo "[INFO] 注入动态库到微信..."
+
+    python3 << 'INJECT_SCRIPT'
 import struct
 
-dylib = '$DYLIB_PATH'
-arm64_off = $ARM64_SLICE_OFFSET + $ARM64_PATCH_VA
-x86_off = $X86_SLICE_OFFSET + $X86_PATCH_VA
-arm64_patch = bytes.fromhex('$ARM64_PATCH_HEX')
-x86_patch = bytes.fromhex('$X86_PATCH_HEX')
+wechat_path = '/Applications/WeChat.app/Contents/MacOS/WeChat'
+dylib_name = b'@executable_path/../Resources/WeChatAntiRevoke.dylib\x00'
+while len(dylib_name) % 4 != 0:
+    dylib_name += b'\x00'
 
-try:
-    with open(dylib, 'r+b') as f:
-        # 验证 arm64 原始字节
-        f.seek(arm64_off)
-        arm64_orig = f.read(4)
-        insn = struct.unpack_from('<I', arm64_orig, 0)[0]
-        if (insn & 0x$ARM64_ORIGINAL_MASK) != 0x$ARM64_ORIGINAL_EXPECT:
-            # 可能已经 patch 过
-            if arm64_orig[:len(arm64_patch)] == arm64_patch[:4]:
-                pass  # 已 patch，继续处理 x86
-            else:
-                print('bad_arm64')
-                exit()
+cmd_size = 24 + len(dylib_name)
+while cmd_size % 4 != 0:
+    cmd_size += 1
+    dylib_name += b'\x00'
 
-        # 验证 x86_64 原始字节
-        f.seek(x86_off)
-        x86_orig = f.read(3)
-        if x86_orig != bytes.fromhex('$X86_ORIGINAL_HEX'):
-            if x86_orig == x86_patch:
-                pass  # 已 patch
-            else:
-                print('bad_x86')
-                exit()
+with open(wechat_path, 'r+b') as f:
+    fat_magic = struct.unpack('>I', f.read(4))[0]
+    assert fat_magic == 0xCAFEBABE
+    narch = struct.unpack('>I', f.read(4))[0]
 
-        # 写入 arm64 patch
-        f.seek(arm64_off)
-        f.write(arm64_patch)
+    slices = []
+    for i in range(narch):
+        cpu = struct.unpack('>I', f.read(4))[0]
+        sub = struct.unpack('>I', f.read(4))[0]
+        offset = struct.unpack('>I', f.read(4))[0]
+        size = struct.unpack('>I', f.read(4))[0]
+        align = struct.unpack('>I', f.read(4))[0]
+        slices.append((cpu, offset, size))
 
-        # 写入 x86_64 patch
-        f.seek(x86_off)
-        f.write(x86_patch)
+    for cpu, slice_offset, size in slices:
+        f.seek(slice_offset)
+        magic = struct.unpack('<I', f.read(4))[0]
+        if magic != 0xFEEDFACF:
+            continue
+        f.read(12)
+        ncmds_pos = f.tell()
+        ncmds = struct.unpack('<I', f.read(4))[0]
+        sizeofcmds_pos = f.tell()
+        sizeofcmds = struct.unpack('<I', f.read(4))[0]
+        f.read(8)
 
-        print('ok')
-except PermissionError:
-    print('permission_denied')
-except Exception as e:
-    print(f'error:{e}')
-" 2>/dev/null
+        # Check if already injected
+        header_end = slice_offset + 32
+        f.seek(header_end)
+        already = False
+        for i in range(ncmds):
+            pos = f.tell()
+            cmd = struct.unpack('<I', f.read(4))[0]
+            cs = struct.unpack('<I', f.read(4))[0]
+            if cmd == 0xC:
+                no = struct.unpack('<I', f.read(4))[0]
+                f.seek(pos + no)
+                name = b''
+                while True:
+                    b = f.read(1)
+                    if b == b'\x00': break
+                    name += b
+                if b'WeChatAntiRevoke' in name:
+                    already = True
+                    break
+            f.seek(pos + cs)
+        if already:
+            continue
+
+        insert_pos = slice_offset + 32 + sizeofcmds
+        lc = struct.pack('<I', 0xC)
+        lc += struct.pack('<I', cmd_size)
+        lc += struct.pack('<I', 24)
+        lc += struct.pack('<I', 2)
+        lc += struct.pack('<I', 0x10000)
+        lc += struct.pack('<I', 0x10000)
+        lc += dylib_name
+        while len(lc) < cmd_size:
+            lc += b'\x00'
+
+        f.seek(insert_pos)
+        f.write(lc)
+        f.seek(ncmds_pos)
+        f.write(struct.pack('<I', ncmds + 1))
+        f.seek(sizeofcmds_pos)
+        f.write(struct.pack('<I', sizeofcmds + cmd_size))
+
+print("ok")
+INJECT_SCRIPT
+
+    echo "[INFO] 注入完成"
 }
 
-# 恢复原始字节
-write_restore() {
-    python3 -c "
-dylib = '$DYLIB_PATH'
-arm64_off = $ARM64_SLICE_OFFSET + $ARM64_PATCH_VA
-x86_off = $X86_SLICE_OFFSET + $X86_PATCH_VA
-
-try:
-    with open('$BACKUP_DIR/arm64.bytes', 'rb') as f:
-        arm64_orig = f.read()
-    with open('$BACKUP_DIR/x86_64.bytes', 'rb') as f:
-        x86_orig = f.read()
-
-    with open(dylib, 'r+b') as f:
-        f.seek(arm64_off)
-        f.write(arm64_orig)
-        f.seek(x86_off)
-        f.write(x86_orig)
-
-    print('ok')
-except PermissionError:
-    print('permission_denied')
-except FileNotFoundError as e:
-    print('no_backup')
-except Exception as e:
-    print(f'error:{e}')
-" 2>/dev/null
-}
-
-# 重签名
 resign_app() {
     echo "[INFO] 重签名..."
-    codesign --force --sign - "$DYLIB_PATH" 2>/dev/null
+    codesign --force --sign - "$DYLIB_DST" 2>/dev/null
+    codesign --force --sign - "$WECHAT_BIN" 2>/dev/null
     codesign --force --deep --sign - "$WECHAT_APP" 2>/dev/null
     xattr -cr "$WECHAT_APP" 2>/dev/null || true
 }
 
-# ======================== 主命令: patch ========================
-do_patch() {
+do_install() {
     print_banner
     check_environment
 
-    echo "[INFO] 微信版本: $EXPECTED_VERSION_STR ($EXPECTED_VERSION)"
-    echo "[INFO] 当前架构: $(uname -m)"
+    echo "[INFO] 微信版本: 4.1.9 ($EXPECTED_VERSION)"
 
-    STATUS=$(get_patch_status)
-    if [ "$STATUS" = "patched" ]; then
-        echo "[INFO] 防撤回补丁已生效，无需重复操作。"
-        echo ""
-        echo "[DONE] 直接打开微信即可: open /Applications/WeChat.app"
-        exit 0
+    # 检查是否已安装
+    if [ -f "$DYLIB_DST" ]; then
+        echo "[INFO] 检测到已安装，将重新安装..."
     fi
 
     kill_wechat
 
-    # 保存原始字节
-    save_original_bytes
-
-    # 尝试写入
-    echo "[INFO] 正在应用补丁 (arm64 + x86_64)..."
-    RESULT=$(write_patch)
-
-    # 如果权限不够，解除保护后重试
-    if [ "$RESULT" = "permission_denied" ]; then
+    # 尝试写入测试
+    if ! touch "$DYLIB_DST" 2>/dev/null; then
         remove_provenance
-        RESULT=$(write_patch)
     fi
+    rm -f "$DYLIB_DST" 2>/dev/null || true
 
-    if [ "$RESULT" != "ok" ]; then
-        echo "[ERROR] 补丁写入失败: $RESULT"
-        echo "        请确认微信未在运行，或尝试重新安装微信后再试。"
-        exit 1
-    fi
-
-    # 重签名
+    compile_dylib
+    inject_dylib
     resign_app
 
-    # 验证
-    if [ "$(get_patch_status)" = "patched" ]; then
-        echo ""
-        echo "=============================="
-        echo " 补丁成功！防撤回已生效"
-        echo "=============================="
-        echo ""
-        echo " 打开微信: open /Applications/WeChat.app"
-        echo ""
-        echo " 恢复原始: $0 --restore"
-        echo " 查看状态: $0 --status"
-        echo ""
+    echo ""
+    echo "=============================="
+    echo " 安装成功！"
+    echo "=============================="
+    echo ""
+    echo " 功能: 对方撤回的消息将保留可见"
+    echo "       自己撤回消息正常工作"
+    echo ""
+    echo " 打开微信: open /Applications/WeChat.app"
+    echo " 卸载: $0 --uninstall"
+    echo ""
+}
+
+do_uninstall() {
+    print_banner
+    echo "[INFO] 卸载防撤回插件..."
+
+    kill_wechat
+
+    # 删除 dylib
+    rm -f "$DYLIB_DST" 2>/dev/null || true
+
+    # 重新安装微信是最干净的卸载方式
+    echo "[INFO] 建议重新安装微信以完全恢复原始状态"
+    echo "[INFO] 或者删除 $DYLIB_DST 并重新签名"
+
+    if [ -f "$DYLIB_DST" ]; then
+        echo "[WARN] 无法删除 dylib，请手动重新安装微信"
     else
-        echo "[ERROR] 补丁验证失败!"
-        exit 1
+        resign_app 2>/dev/null || true
+        echo ""
+        echo "=============================="
+        echo " 已卸载（dylib 已删除）"
+        echo " 建议重新安装微信以彻底恢复"
+        echo "=============================="
     fi
-}
-
-# ======================== 主命令: restore ========================
-do_restore() {
-    print_banner
-    check_environment
-
-    STATUS=$(get_patch_status)
-    if [ "$STATUS" = "original" ]; then
-        echo "[INFO] 微信未被修改，无需恢复。"
-        exit 0
-    fi
-
-    if [ ! -f "$BACKUP_DIR/arm64.bytes" ] || [ ! -f "$BACKUP_DIR/x86_64.bytes" ]; then
-        echo "[ERROR] 未找到备份文件: $BACKUP_DIR/"
-        echo "        无法恢复。建议重新安装微信。"
-        exit 1
-    fi
-
-    kill_wechat
-
-    echo "[INFO] 正在恢复原始微信..."
-
-    RESULT=$(write_restore)
-
-    if [ "$RESULT" = "permission_denied" ]; then
-        remove_provenance
-        RESULT=$(write_restore)
-    fi
-
-    if [ "$RESULT" != "ok" ]; then
-        echo "[ERROR] 恢复失败: $RESULT"
-        exit 1
-    fi
-
-    resign_app
-
-    echo ""
-    echo "=============================="
-    echo " 已恢复原始微信"
-    echo "=============================="
-    echo ""
-}
-
-# ======================== 主命令: status ========================
-do_status() {
-    print_banner
-    check_environment
-
-    STATUS=$(get_patch_status)
-    echo "[INFO] 微信版本: $EXPECTED_VERSION_STR ($EXPECTED_VERSION)"
-    echo "[INFO] 当前架构: $(uname -m)"
-    case "$STATUS" in
-        patched)
-            echo "[INFO] 补丁状态: 已生效 (arm64 + x86_64 均已 patch)"
-            ;;
-        partial)
-            echo "[WARN] 补丁状态: 部分生效 (建议重新运行 $0)"
-            ;;
-        original)
-            echo "[INFO] 补丁状态: 未应用 (原始状态)"
-            ;;
-        *)
-            echo "[WARN] 补丁状态: 未知 (文件可能被其他工具修改)"
-            ;;
-    esac
     echo ""
 }
 
 # ======================== 入口 ========================
 case "${1:-}" in
-    --restore|-r)
-        do_restore
-        ;;
-    --status|-s)
-        do_status
+    --uninstall|-u)
+        do_uninstall
         ;;
     --help|-h)
         print_banner
-        print_usage
+        echo "用法:"
+        echo "  $0              安装防撤回"
+        echo "  $0 --uninstall  卸载"
+        echo "  $0 --help       帮助"
         ;;
     "")
-        do_patch
+        do_install
         ;;
     *)
         echo "[ERROR] 未知参数: $1"
-        echo ""
-        print_usage
         exit 1
         ;;
 esac
