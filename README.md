@@ -32,6 +32,7 @@ macOS 系统自带工具，无需额外安装：
 - python3
 - codesign
 - tar
+
 如未安装 Xcode Command Line Tools，运行：xcode-select --install
 
 ### 已知限制
