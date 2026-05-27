@@ -7,7 +7,7 @@ macOS 微信防撤回工具。
 
 ### 原理
 
-修改 `wechat.dylib` 中的 `isRevokeMessage()` 函数，使其始终返回 false。微信将不再识别收到的撤回通知，原消息保持可见。自己主动撤回消息会闪退（后面修复）。
+修改 `wechat.dylib` 中的 `isRevokeMessage()` 函数，使其始终返回 false。微信将不再识别收到的撤回通知，原消息保持可见。不影响自己主动撤回消息。
 
 ### 适用范围
 
