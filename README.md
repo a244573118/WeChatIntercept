@@ -7,9 +7,7 @@ macOS 微信防撤回工具。
 
 ### 原理
 
-通过注入一个运行时 hook 动态库（`WeChatAntiRevoke.dylib`），利用微信内建的 hook dispatch slot 机制拦截 `isRevokeMessage()` 函数。在运行时区分消息来源：
-- 对方撤回 → 返回 false（消息保留不被删除）
-- 自己撤回 → 返回 true（正常处理，不会闪退）
+通过注入一个运行时 hook 动态库（`WeChatAntiRevoke.dylib`），利用微信内建的 hook dispatch slot 机制拦截 `isRevokeMessage()` 函数。
 
 ### 适用范围
 
