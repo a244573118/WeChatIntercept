@@ -3,11 +3,13 @@ macOS 微信防撤回工具。
 
 ## 最新版本（v4.1.9）
 
-**支持微信 4.1.9**，适配微信全新 C++ 架构，纯二进制补丁，一键生效。
+**支持微信 4.1.9**，适配微信全新 C++ 架构，通过 DYLD 运行时注入实现防撤回，一键生效。
 
 ### 原理
 
-修改 `wechat.dylib` 中的 `isRevokeMessage()` 函数，使其始终返回 false。微信将不再识别收到的撤回通知，原消息保持可见。不影响自己主动撤回消息。
+通过注入一个运行时 hook 动态库（`WeChatAntiRevoke.dylib`），利用微信内建的 hook dispatch slot 机制拦截 `isRevokeMessage()` 函数。在运行时区分消息来源：
+- 对方撤回 → 返回 false（消息保留不被删除）
+- 自己撤回 → 返回 true（正常处理，不会闪退）
 
 ### 适用范围
 
@@ -17,10 +19,10 @@ macOS 微信防撤回工具。
 ### 使用
 
 ```bash
-chmod +x patch.sh     # 添加可执行权限
-./patch.sh            # 应用补丁
-./patch.sh --status   # 查看状态
-./patch.sh --restore  # 恢复原始
+chmod +x patch.sh       # 添加可执行权限
+./patch.sh              # 安装防撤回
+./patch.sh --uninstall  # 卸载
+./patch.sh --help       # 帮助
 ```
 
 首次运行可能需要约 30 秒（自动解除系统文件保护）。
@@ -28,9 +30,11 @@ chmod +x patch.sh     # 添加可执行权限
 ### 依赖
 
 macOS 系统自带工具，无需额外安装：
+- clang（Xcode Command Line Tools）
 - python3
 - codesign
 - tar
+如未安装 Xcode Command Line Tools，运行：xcode-select --install
 
 ### 已知限制
 
