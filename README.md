@@ -11,7 +11,7 @@ macOS 微信防撤回工具。
 
 ### 适用范围
 
-- macOS 微信 4.1.9以上
+- macOS 微信 4.1.9及以上
 - Apple Silicon（arm64）及 Intel（x86_64）
 
 ### 使用
