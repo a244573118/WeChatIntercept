@@ -59,6 +59,8 @@ notify=1    # 1=开启撤回通知, 0=关闭
 修改后立即生效，无需重启微信。
 
 #### 注意：需要给脚本编辑器打开通知权限！！！
+<img width="912" height="108" alt="image" src="https://github.com/user-attachments/assets/5865c263-7511-4b58-92a0-e69edba54f3d" />
+
 
 ### 依赖
 
