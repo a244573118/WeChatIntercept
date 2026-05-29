@@ -109,8 +109,9 @@ compile_dylib() {
 #import <stdint.h>
 #import <string.h>
 #import <stdio.h>
+#import <sys/stat.h>
 
-// ── 日志（写入 /tmp/antirevoke_debug.log）────────────────────
+// ── 日志 ─────────────────────────────────────────────────────
 static FILE *g_logFile = NULL;
 
 static void log_open(void) {
@@ -121,26 +122,24 @@ static void log_open(void) {
     if (g_logFile) { fprintf(g_logFile, "[AntiRevoke] " fmt "\n", ##__VA_ARGS__); fflush(g_logFile); } \
 } while(0)
 
-// ── 公共常量 ────────────────────────────────────────────────
+// ── 常量 ─────────────────────────────────────────────────────
 static const char    *kDylibSuffix_Resources  = "Resources/wechat.dylib";
 static const char    *kDylibSuffix_Frameworks = "Frameworks/wechat.dylib";
 static const int32_t  kRevokeType    = 0x2712;   // 10002
 
-// ── 版本地址表 ───────────────────────────────────────────────
-// 4.1.9  (CFBundleVersion 268602)
-//   arm64:  hook dispatch slot VA = 0x9301838  (BSS，运行时可写)
-//   x86_64: 暂不需要 slot（x86_64 直接 inline patch，同 4.1.10）
-static const uintptr_t k419_SlotVA_arm64   = 0x9301838;
+// 配置文件路径：~/.config/antirevoke/config
+// 格式：每行一个 key=value
+// notify=1  开启通知（默认）
+// notify=0  关闭通知
+static char g_config_path[512] = {0};
 
-// 4.1.10 (CFBundleVersion 268824)  — dispatch slot 已移除，改用 inline trampoline
+// ── 版本地址表 ───────────────────────────────────────────────
+static const uintptr_t k419_SlotVA_arm64   = 0x9301838;
 static const uintptr_t k4110_FuncVA_arm64  = 0x44FFE20;
 static const uintptr_t k4110_FuncVA_x86_64 = 0x4B4E9A0;
-
-// 4.1.9  x86_64 函数 VA（inline trampoline，与 4.1.10 流程相同）
 static const uintptr_t k419_FuncVA_x86_64  = 0x4AF08D0;
 
-// ── 获取当前登录用户 ID（完整字符串）─────────────────────────
-// 懒加载：首次遇到撤回消息时从 app_data/login/ 读取最近登录的用户目录名
+// ── 获取当前登录用户 ID ──────────────────────────────────────
 static char g_my_id[64] = {0};
 static _Bool g_my_id_loaded = 0;
 
@@ -159,10 +158,7 @@ static void load_my_user_id(void) {
         NSFileManager *fm = [NSFileManager defaultManager];
         NSString *dirPath = [NSString stringWithUTF8String:loginDir];
         NSArray *contents = [fm contentsOfDirectoryAtPath:dirPath error:nil];
-        if (!contents || [contents count] == 0) {
-            ARLOG("WARN: login 目录为空或不存在");
-            return;
-        }
+        if (!contents || [contents count] == 0) return;
 
         NSString *latestName = nil;
         NSDate *latestDate = nil;
@@ -187,14 +183,57 @@ static void load_my_user_id(void) {
 
         if (latestName && [latestName length] >= 3 && [latestName length] < sizeof(g_my_id)) {
             strncpy(g_my_id, [latestName UTF8String], sizeof(g_my_id) - 1);
-            ARLOG("当前用户 ID: %s", g_my_id);
-        } else {
-            ARLOG("WARN: 未能获取当前用户 ID");
+            ARLOG("用户: %s", g_my_id);
         }
     }
 }
 
-// ── hook 函数（所有版本共用）────────────────────────────────
+// ── 配置 ─────────────────────────────────────────────────────
+static void init_config_path(void) {
+    const char *home = getenv("HOME");
+    if (home) {
+        snprintf(g_config_path, sizeof(g_config_path), "%s/.config/antirevoke/config", home);
+    }
+}
+
+static _Bool is_notify_enabled(void) {
+    if (g_config_path[0] == '\0') return 1;  // 配置路径未初始化，默认开启
+    FILE *f = fopen(g_config_path, "r");
+    if (!f) return 1;  // 配置文件不存在，默认开启
+    char line[128];
+    _Bool enabled = 1;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "notify=0", 8) == 0) { enabled = 0; break; }
+    }
+    fclose(f);
+    return enabled;
+}
+
+static void send_notification(const char *text) {
+    if (!is_notify_enabled()) return;
+
+    // 对英文双引号和反斜杠做转义
+    char *escaped = (char *)malloc(1024);
+    if (!escaped) return;
+    int j = 0;
+    for (int i = 0; text[i] && j < 1022; i++) {
+        if (text[i] == '"' || text[i] == '\\') escaped[j++] = '\\';
+        escaped[j++] = text[i];
+    }
+    escaped[j] = '\0';
+
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        FILE *sf = fopen("/tmp/antirevoke_notify.scpt", "w");
+        if (sf) {
+            fprintf(sf, "display notification \"%s\" with title \"WeChatIntercept\"\n", escaped);
+            fclose(sf);
+            system("osascript /tmp/antirevoke_notify.scpt");
+        }
+        free(escaped);
+    });
+}
+
+// ── hook 函数 ────────────────────────────────────────────────
 __attribute__((visibility("default")))
 _Bool hook_isRevokeMessage(void *msg) {
     if (msg == NULL) return 0;
@@ -202,27 +241,46 @@ _Bool hook_isRevokeMessage(void *msg) {
     int32_t msgType = *(int32_t *)((uint8_t *)msg + 0x0C);
     if (msgType != kRevokeType) return 0;
 
-    // 懒加载当前用户 ID（首次遇到撤回消息时，登录一定已完成）
     load_my_user_id();
 
-    // msg+0x18: 撤回操作发起者的 ID（std::string SSO buffer，直接存储字符内容）
     const char *sender = (const char *)((uint8_t *)msg + 0x18);
 
-    // 判断逻辑：
-    // 1. field18 为空 → 自己撤回确认 → 放行
-    // 2. field18 == 自己 ID → 自己撤回 → 放行
-    // 3. 其他 → 对方撤回 → 阻止
-    if (sender[0] == '\0') {
-        ARLOG("自己撤回（field=空），放行");
-        return 1;
+    // 自己撤回 → 放行
+    if (sender[0] == '\0') return 1;
+    if (g_my_id[0] != '\0' && strncmp(sender, g_my_id, strlen(g_my_id)) == 0) return 1;
+
+    // 对方撤回 → 阻止
+    ARLOG("拦截: %.20s", sender);
+
+    // 提取 replacemsg 并发通知
+    const char *xml_body = NULL;
+    uint64_t xml_ptr = *(uint64_t *)((uint8_t *)msg + 0x130);
+    uint64_t xml_len = *(uint64_t *)((uint8_t *)msg + 0x138);
+    if (xml_ptr != 0 && xml_len > 0 && xml_len < 4096)
+        xml_body = (const char *)xml_ptr;
+
+    char notify_text[256] = {0};
+    if (xml_body) {
+        const char *cs = strstr(xml_body, "<![CDATA[");
+        const char *ce = cs ? strstr(cs, "]]>") : NULL;
+        if (cs && ce) {
+            cs += 9;
+            size_t len = ce - cs;
+            if (len > 0 && len < sizeof(notify_text) - 1) {
+                memcpy(notify_text, cs, len);
+                notify_text[len] = '\0';
+            }
+        }
     }
 
-    if (g_my_id[0] != '\0' && strncmp(sender, g_my_id, strlen(g_my_id)) == 0) {
-        ARLOG("自己撤回（%s），放行", g_my_id);
-        return 1;
-    }
+    char content[512] = {0};
+    if (notify_text[0] != '\0')
+        snprintf(content, sizeof(content), "拦截到%s", notify_text);
+    else
+        snprintf(content, sizeof(content), "拦截到 %s 撤回了一条消息", sender);
 
-    ARLOG("对方撤回（%.20s），已阻止", sender);
+    send_notification(content);
+
     return 0;
 }
 
@@ -309,6 +367,7 @@ static void hook_init(void) {
         dispatch_get_main_queue(), ^{
 
         log_open();
+        init_config_path();
         ARLOG("hook_init 启动");
 
         uintptr_t slide = find_wechat_slide();
@@ -615,6 +674,13 @@ do_install() {
     resign_app
     verify_install
 
+    # 创建默认配置（开启通知）
+    local CONFIG_DIR="$HOME/.config/antirevoke"
+    mkdir -p "$CONFIG_DIR"
+    if [ ! -f "$CONFIG_DIR/config" ]; then
+        echo "notify=1" > "$CONFIG_DIR/config"
+    fi
+
     echo ""
     echo "=============================="
     echo " 安装成功！"
@@ -623,13 +689,68 @@ do_install() {
     echo " 功能: 对方撤回的消息将保留可见"
     echo "       自己撤回消息正常工作"
     echo ""
-    echo " 验证步骤:"
-    echo "   1. 让别人发一条消息，然后撤回"
-    echo "   2. 如果消息保留可见 → 防撤回生效"
-    echo "   3. 如果消息仍被撤回 → 执行以下命令查看调试日志:"
-    echo "      cat /tmp/antirevoke_debug.log"
+    echo " 通知开关:"
+    echo "   $0 openNotify   开启撤回通知"
+    echo "   $0 closeNotify  关闭撤回通知"
     echo ""
     echo " 卸载: $0 --uninstall"
+    echo ""
+}
+
+do_debug() {
+    print_banner
+    echo "[INFO] 调试模式（不安装 hook，仅签名允许 lldb attach）"
+
+    check_environment
+    kill_wechat
+    remove_provenance
+
+    # 删除已有的 hook dylib（确保无 hook）
+    rm -f "$DYLIB_DST" 2>/dev/null || true
+
+    # 签名（带 get-task-allow，允许 lldb attach）
+    echo "[INFO] 重签名（注入调试 entitlements）..."
+    local ENT_FILE=$(mktemp /tmp/entitlements_XXXXXX.plist)
+    cat > "$ENT_FILE" << 'ENTITLEMENTS'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.get-task-allow</key>
+    <true/>
+</dict>
+</plist>
+ENTITLEMENTS
+
+    codesign --force --deep --sign - "$WECHAT_APP" 2>/dev/null
+    codesign --force --sign - --entitlements "$ENT_FILE" "$WECHAT_BIN" 2>/dev/null
+    xattr -cr "$WECHAT_APP" 2>/dev/null || true
+    rm -f "$ENT_FILE"
+
+    echo "[INFO] 启动微信..."
+    open "$WECHAT_APP"
+    sleep 3
+
+    echo ""
+    echo "=============================="
+    echo " 调试模式已启用"
+    echo "=============================="
+    echo ""
+    echo " 微信无 hook，撤回流程完整执行"
+    echo " 可使用 lldb attach 进行逆向分析"
+    echo ""
+    echo " 命令："
+    echo "   lldb -p \$(pgrep -x WeChat)"
+    echo "   image list wechat.dylib"
+    echo "   # Resources 行地址 = slide"
+    echo "   br set -a <slide+0x4D5FD70>"
+    echo "   c"
+    echo ""
+    echo " 恢复防撤回: $0"
     echo ""
 }
 
@@ -659,8 +780,40 @@ do_uninstall() {
     echo ""
 }
 
+CONFIG_DIR="$HOME/.config/antirevoke"
+CONFIG_FILE="$CONFIG_DIR/config"
+
+do_open_notify() {
+    mkdir -p "$CONFIG_DIR"
+    if grep -q "^notify=" "$CONFIG_FILE" 2>/dev/null; then
+        sed -i '' 's/^notify=.*/notify=1/' "$CONFIG_FILE"
+    else
+        echo "notify=1" >> "$CONFIG_FILE"
+    fi
+    echo "[INFO] 撤回通知已开启"
+}
+
+do_close_notify() {
+    mkdir -p "$CONFIG_DIR"
+    if grep -q "^notify=" "$CONFIG_FILE" 2>/dev/null; then
+        sed -i '' 's/^notify=.*/notify=0/' "$CONFIG_FILE"
+    else
+        echo "notify=0" >> "$CONFIG_FILE"
+    fi
+    echo "[INFO] 撤回通知已关闭"
+}
+
 # ======================== 入口 ========================
 case "${1:-}" in
+    openNotify)
+        do_open_notify
+        ;;
+    closeNotify)
+        do_close_notify
+        ;;
+    --debug|-d)
+        do_debug
+        ;;
     --uninstall|-u)
         do_uninstall
         ;;
@@ -668,6 +821,9 @@ case "${1:-}" in
         print_banner
         echo "用法:"
         echo "  $0              安装防撤回"
+        echo "  $0 openNotify   开启撤回通知"
+        echo "  $0 closeNotify  关闭撤回通知"
+        echo "  $0 --debug      调试模式（无 hook，允许 lldb）"
         echo "  $0 --uninstall  卸载"
         echo "  $0 --help       帮助"
         ;;
@@ -676,6 +832,7 @@ case "${1:-}" in
         ;;
     *)
         echo "[ERROR] 未知参数: $1"
+        echo "用法: $0 [openNotify|closeNotify|--uninstall|--debug|--help]"
         exit 1
         ;;
 esac
