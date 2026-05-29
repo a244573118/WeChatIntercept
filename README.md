@@ -83,10 +83,6 @@ cat /tmp/antirevoke_debug.log   # 查看运行时日志
 
   旧版微信 macOS（3.x）使用 Objective-C，可通过 Method Swizzling 调用内部消息插入 API。4.x 版本核心逻辑全部迁移到 C++（仅剩 65 个 ObjC 类，90MB+ 代码段，符号已 strip），撤回处理通过虚函数 + 加密数据库 + 协程调度完成，无法稳定地从外部构造调用链插入消息。
 
-### 技术文档
-
-详细的逆向分析过程和适配指南见 [`doc/reverse-engineering-guide.md`](doc/reverse-engineering-guide.md)。
-
 ---
 
 ## 旧版本
