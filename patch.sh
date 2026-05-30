@@ -252,15 +252,15 @@ _Bool hook_isRevokeMessage(void *msg) {
     // 对方撤回 → 阻止
     ARLOG("拦截: %.20s", sender);
 
-    // 提取 replacemsg 并发通知
-    const char *xml_body = NULL;
+    // 提取通知内容
+    char notify_text[256] = {0};
+
+#if defined(__arm64__) || defined(__aarch64__)
+    // arm64：从 msg+0x130 读取 XML body，提取 replacemsg（含用户昵称）
     uint64_t xml_ptr = *(uint64_t *)((uint8_t *)msg + 0x130);
     uint64_t xml_len = *(uint64_t *)((uint8_t *)msg + 0x138);
-    if (xml_ptr != 0 && xml_len > 0 && xml_len < 4096)
-        xml_body = (const char *)xml_ptr;
-
-    char notify_text[256] = {0};
-    if (xml_body) {
+    if (xml_ptr > 0x100000000ULL && xml_len > 0 && xml_len < 4096) {
+        const char *xml_body = (const char *)xml_ptr;
         const char *cs = strstr(xml_body, "<![CDATA[");
         const char *ce = cs ? strstr(cs, "]]>") : NULL;
         if (cs && ce) {
@@ -272,6 +272,7 @@ _Bool hook_isRevokeMessage(void *msg) {
             }
         }
     }
+#endif
 
     char content[512] = {0};
     if (notify_text[0] != '\0')
