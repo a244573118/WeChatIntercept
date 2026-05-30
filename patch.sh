@@ -518,7 +518,7 @@ resign_app() {
     echo "[INFO] 重签名（注入 entitlements 绕过 Library Validation）..."
 
     # 创建 entitlements 文件
-    local ENT_FILE=$(mktemp /tmp/entitlements_XXXXXX.plist)
+    local ENT_FILE="/tmp/antirevoke_ent.plist"
     cat > "$ENT_FILE" << 'ENTITLEMENTS'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
