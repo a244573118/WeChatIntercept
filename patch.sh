@@ -33,15 +33,11 @@ WECHAT_BIN="$WECHAT_APP/Contents/MacOS/WeChat"
 DYLIB_DST="$WECHAT_APP/Contents/Resources/WeChatAntiRevoke.dylib"
 DYLIB_INSTALL_NAME="@executable_path/../Resources/WeChatAntiRevoke.dylib"
 
-# 支持的版本列表
-VERSION_419="268602"
-VERSION_4110="268824"
-
 print_banner() {
     echo ""
     echo "=============================="
     echo " 微信防撤回安装工具"
-    echo " 适用: macOS / 微信 4.1.9 & 4.1.10"
+    echo " 适用: macOS / 微信 4.1.9+"
     echo " 支持: Apple Silicon + Intel"
     echo "=============================="
     echo ""
@@ -53,11 +49,27 @@ check_environment() {
         exit 1
     fi
 
+    SHORT_VER=$(defaults read "$WECHAT_APP/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null)
     VERSION=$(defaults read "$WECHAT_APP/Contents/Info.plist" CFBundleVersion 2>/dev/null)
-    if [ "$VERSION" != "$VERSION_419" ] && [ "$VERSION" != "$VERSION_4110" ]; then
-        echo "[ERROR] 不支持的微信版本 (实际 $VERSION，支持 $VERSION_419 / $VERSION_4110)"
+
+    if [ -z "$SHORT_VER" ]; then
+        echo "[ERROR] 无法读取微信版本号，请检查 /Applications/WeChat.app 是否完整"
         exit 1
     fi
+
+    # 大版本校验：仅支持 4.1.x 系列（C++ 架构）
+    case "$SHORT_VER" in
+        4.1.*)
+            echo "[INFO] 微信版本: $SHORT_VER ($VERSION)"
+            ;;
+        *)
+            echo "[ERROR] 不支持的微信大版本: $SHORT_VER"
+            echo "        本工具仅支持 4.1.x 系列"
+            echo "        旧版 3.x 请使用 Install.sh"
+            echo "        如果你认为这是误判，请提交 issue"
+            exit 1
+            ;;
+    esac
 
     if ! command -v clang &>/dev/null; then
         echo "[ERROR] 未找到 clang，请安装 Xcode Command Line Tools:"
@@ -99,10 +111,12 @@ compile_dylib() {
     echo "[INFO] 编译 hook 动态库..."
 
     # 内嵌 hook.m 源码
-    local SRC_FILE=$(mktemp /tmp/hook_XXXXXX.m)
+    local SRC_FILE="/tmp/antirevoke_hook_src.m"
+    rm -f "$SRC_FILE"
     cat > "$SRC_FILE" << 'HOOK_SOURCE'
 #import <Foundation/Foundation.h>
 #import <mach-o/dyld.h>
+#import <mach-o/loader.h>
 #import <mach/mach.h>
 #import <sys/mman.h>
 #import <libkern/OSCacheControl.h>
@@ -233,6 +247,18 @@ static void send_notification(const char *text) {
     });
 }
 
+// ── 检查 sender 偏移是否仍有效 ───────────────────────────────
+// 仅检查前 4 字节是否为可打印 ASCII（微信 ID 总以可打印字符开头）
+// 缩小检查范围避免误判撤回流程中的二次调用（其 sender 可能是 std::string 元数据）
+static _Bool is_valid_sender(const char *s) {
+    if (s[0] == '\0') return 1;  // 空字符串 = 自己撤回确认
+    for (int i = 0; i < 4; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x20 || c > 0x7E) return 0;  // 非可打印字符
+    }
+    return 1;
+}
+
 // ── hook 函数 ────────────────────────────────────────────────
 __attribute__((visibility("default")))
 _Bool hook_isRevokeMessage(void *msg) {
@@ -244,6 +270,32 @@ _Bool hook_isRevokeMessage(void *msg) {
     load_my_user_id();
 
     const char *sender = (const char *)((uint8_t *)msg + 0x18);
+
+    // 检查 sender 偏移是否仍有效（前 4 字节必须可打印 ASCII）
+    // 失效时静默放行（return 1），避免影响撤回流程的内部状态
+    // 真正的偏移失效会持续触发，达到阈值时弹一次"催更新"通知
+    if (!is_valid_sender(sender)) {
+        ARLOG("WARN: sender 区域非可打印 ASCII，跳过此次调用");
+
+        // 累计失效次数，达到阈值时弹通知催更新（仅一次）
+        static int g_invalid_count = 0;
+        static _Bool g_warned = 0;
+        g_invalid_count++;
+        if (g_invalid_count >= 5 && !g_warned) {
+            g_warned = 1;
+            char *cmd = (char *)malloc(1024);
+            if (cmd) {
+                snprintf(cmd, 1024,
+                    "osascript -e 'display notification \"sender 偏移已失效，快去催 WeChatIntercept 作者更新适配\" "
+                    "with title \"WeChatIntercept 需更新\"' &");
+                dispatch_async(dispatch_get_global_queue(0, 0), ^{
+                    system(cmd);
+                    free(cmd);
+                });
+            }
+        }
+        return 1;  // 静默放行，不影响业务流程
+    }
 
     // 自己撤回 → 放行
     if (sender[0] == '\0') return 1;
@@ -285,11 +337,12 @@ _Bool hook_isRevokeMessage(void *msg) {
     return 0;
 }
 
-// ── 查找 wechat.dylib 的 ASLR slide ─────────────────────────
+// ── 查找 wechat.dylib 的 ASLR slide 和 mach_header ───────────
 // 优先匹配 Resources/wechat.dylib（核心库），Frameworks/ 为 stub 不可用
-static uintptr_t find_wechat_slide(void) {
+static uintptr_t find_wechat_slide(const struct mach_header **out_header) {
     uint32_t count = _dyld_image_count();
     uintptr_t fallback = 0;
+    const struct mach_header *fallback_header = NULL;
     size_t resLen = strlen(kDylibSuffix_Resources);
     size_t fwLen  = strlen(kDylibSuffix_Frameworks);
 
@@ -297,12 +350,131 @@ static uintptr_t find_wechat_slide(void) {
         const char *name = _dyld_get_image_name(i);
         if (!name) continue;
         size_t len = strlen(name);
-        if (len >= resLen && strcmp(name + len - resLen, kDylibSuffix_Resources) == 0)
+        if (len >= resLen && strcmp(name + len - resLen, kDylibSuffix_Resources) == 0) {
+            if (out_header) *out_header = _dyld_get_image_header(i);
             return (uintptr_t)_dyld_get_image_vmaddr_slide(i);
-        if (len >= fwLen && strcmp(name + len - fwLen, kDylibSuffix_Frameworks) == 0)
+        }
+        if (len >= fwLen && strcmp(name + len - fwLen, kDylibSuffix_Frameworks) == 0) {
             fallback = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
+            fallback_header = _dyld_get_image_header(i);
+        }
     }
+    if (out_header) *out_header = fallback_header;
     return fallback;
+}
+
+// ── 解析 wechat.dylib 的 __TEXT 段范围 ───────────────────────
+// 返回 1 = 成功，0 = 失败
+static _Bool find_text_segment(const struct mach_header *header, uintptr_t slide,
+                                uintptr_t *out_start, size_t *out_size) {
+    if (!header) return 0;
+
+    const uint8_t *p = (const uint8_t *)header;
+    uint32_t ncmds;
+    if (header->magic == MH_MAGIC_64) {
+        p += sizeof(struct mach_header_64);
+        ncmds = ((const struct mach_header_64 *)header)->ncmds;
+    } else if (header->magic == MH_MAGIC) {
+        p += sizeof(struct mach_header);
+        ncmds = header->ncmds;
+    } else {
+        return 0;
+    }
+
+    for (uint32_t i = 0; i < ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)p;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)p;
+            if (strcmp(seg->segname, "__TEXT") == 0) {
+                *out_start = (uintptr_t)seg->vmaddr + slide;
+                *out_size = (size_t)seg->vmsize;
+                return 1;
+            }
+        } else if (lc->cmd == LC_SEGMENT) {
+            const struct segment_command *seg = (const struct segment_command *)p;
+            if (strcmp(seg->segname, "__TEXT") == 0) {
+                *out_start = (uintptr_t)seg->vmaddr + slide;
+                *out_size = (size_t)seg->vmsize;
+                return 1;
+            }
+        }
+        p += lc->cmdsize;
+    }
+    return 0;
+}
+
+// ── 特征码搜索：在 __TEXT 段中查找 isRevokeMessage 函数 ──────
+// arm64 特征：5 条指令的 isRevokeMessage（无 dispatch slot 的 4.1.10 形态）
+//   LDR W8, [X0, #0xC]; MOV W9, #0x2712; CMP W8, W9; CSET W0, EQ; RET
+// 返回函数 VA（slide + offset），未找到返回 0
+static uintptr_t scan_isRevokeMessage_arm64(uintptr_t text_start, size_t text_size) {
+    static const uint32_t pattern[5] = {
+        0xB9400C08u, 0x5284E249u, 0x6B09011Fu, 0x1A9F17E0u, 0xD65F03C0u
+    };
+    const uint32_t *base = (const uint32_t *)text_start;
+    size_t count = text_size / 4;
+    if (count < 5) return 0;
+
+    for (size_t i = 0; i + 5 <= count; i++) {
+        if (base[i]   == pattern[0] &&
+            base[i+1] == pattern[1] &&
+            base[i+2] == pattern[2] &&
+            base[i+3] == pattern[3] &&
+            base[i+4] == pattern[4]) {
+            return text_start + i * 4;
+        }
+    }
+    return 0;
+}
+
+// x86_64 特征：完整函数（16 字节）
+//   55 48 89 E5 (push rbp; mov rbp,rsp)
+//   81 7F 0C 12 27 00 00 (cmp [rdi+0xC], 0x2712)
+//   0F 94 C0 (sete al)
+//   5D C3 (pop rbp; ret)
+static uintptr_t scan_isRevokeMessage_x86_64(uintptr_t text_start, size_t text_size) {
+    static const uint8_t pattern[] = {
+        0x55, 0x48, 0x89, 0xE5,
+        0x81, 0x7F, 0x0C, 0x12, 0x27, 0x00, 0x00,
+        0x0F, 0x94, 0xC0,
+        0x5D, 0xC3
+    };
+    const uint8_t *base = (const uint8_t *)text_start;
+    if (text_size < sizeof(pattern)) return 0;
+
+    for (size_t i = 0; i + sizeof(pattern) <= text_size; i++) {
+        if (base[i] == pattern[0] &&
+            memcmp(base + i, pattern, sizeof(pattern)) == 0) {
+            return text_start + i;
+        }
+    }
+    return 0;
+}
+
+// ── 版本检测 ─────────────────────────────────────────────────
+// 已知支持的 build：4.1.9 (268602)、4.1.10 (268824)
+static const char *kKnownBuilds[] = { "268602", "268824", NULL };
+
+static _Bool is_known_build(const char *build) {
+    if (!build) return 0;
+    for (int i = 0; kKnownBuilds[i]; i++) {
+        if (strcmp(build, kKnownBuilds[i]) == 0) return 1;
+    }
+    return 0;
+}
+
+// 读取 Info.plist 中的 CFBundleVersion + CFBundleShortVersionString
+static void read_wechat_version(char *short_ver, size_t short_sz,
+                                  char *build, size_t build_sz) {
+    short_ver[0] = '\0';
+    build[0] = '\0';
+    @autoreleasepool {
+        NSDictionary *info = [[NSBundle bundleWithPath:@"/Applications/WeChat.app"] infoDictionary];
+        NSString *sv = info[@"CFBundleShortVersionString"];
+        NSString *bv = info[@"CFBundleVersion"];
+        if (sv) strncpy(short_ver, [sv UTF8String], short_sz - 1);
+        if (bv) strncpy(build, [bv UTF8String], build_sz - 1);
+    }
 }
 
 // ── 内存保护工具 ─────────────────────────────────────────────
@@ -360,6 +532,49 @@ static _Bool install_x86_64_trampoline(uintptr_t func_addr, uintptr_t hook_addr)
     return 1;
 }
 
+// ── Hook 安装失败时通知用户 ─────────────────────────────────
+static void notify_install_failed(const char *short_ver, const char *build, _Bool known_build) {
+    if (!is_notify_enabled()) return;
+
+    char *cmd = (char *)malloc(2048);
+    if (!cmd) return;
+
+    char title[64];
+    char body[512];
+
+    if (known_build) {
+        // 已知 build 但仍失败（极罕见）
+        snprintf(title, sizeof(title), "WeChatIntercept 异常");
+        snprintf(body, sizeof(body),
+            "已知版本 %s (%s) hook 安装失败，请查看 /tmp/antirevoke_debug.log",
+            short_ver, build);
+    } else {
+        // 未知 build：可能是版本变化或仅 build 号变化
+        snprintf(title, sizeof(title), "WeChatIntercept 需更新");
+        snprintf(body, sizeof(body),
+            "微信版本 %s (build %s) 未适配，防撤回功能已失效。请前往 GitHub 获取最新脚本",
+            short_ver, build);
+    }
+
+    // 转义 body 中的双引号和反斜杠
+    char escaped[1024];
+    int j = 0;
+    for (int i = 0; body[i] && j < (int)sizeof(escaped) - 2; i++) {
+        if (body[i] == '"' || body[i] == '\\') escaped[j++] = '\\';
+        escaped[j++] = body[i];
+    }
+    escaped[j] = '\0';
+
+    snprintf(cmd, 2048,
+        "osascript -e 'display notification \"%s\" with title \"%s\"' &",
+        escaped, title);
+
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        system(cmd);
+        free(cmd);
+    });
+}
+
 // ── 主 constructor ───────────────────────────────────────────
 __attribute__((constructor))
 static void hook_init(void) {
@@ -371,43 +586,125 @@ static void hook_init(void) {
         init_config_path();
         ARLOG("hook_init 启动");
 
-        uintptr_t slide = find_wechat_slide();
-        if (slide == 0) { ARLOG("ERROR: 未找到 wechat.dylib"); return; }
+        // 读取微信版本
+        char short_ver[32] = {0};
+        char build[32] = {0};
+        read_wechat_version(short_ver, sizeof(short_ver), build, sizeof(build));
+        _Bool known_build = is_known_build(build);
+        ARLOG("微信版本: %s (build %s) %s", short_ver, build,
+              known_build ? "[已适配]" : "[未适配]");
+
+        const struct mach_header *header = NULL;
+        uintptr_t slide = find_wechat_slide(&header);
+        if (slide == 0) {
+            ARLOG("ERROR: 未找到 wechat.dylib");
+            notify_install_failed(short_ver, build, known_build);
+            return;
+        }
+
+        // 解析 __TEXT 段范围（用于特征码搜索）
+        uintptr_t text_start = 0;
+        size_t text_size = 0;
+        _Bool has_text = find_text_segment(header, slide, &text_start, &text_size);
+        ARLOG("slide=0x%lx __TEXT=[0x%lx, +0x%zx) found=%d",
+              (unsigned long)slide, (unsigned long)text_start, text_size, has_text);
 
         uintptr_t hook = (uintptr_t)&hook_isRevokeMessage;
-        ARLOG("slide=0x%lx hook=0x%lx", (unsigned long)slide, (unsigned long)hook);
+        _Bool installed = 0;
 
 #if defined(__arm64__) || defined(__aarch64__)
+        // 1. 先尝试硬编码地址（快速路径）
+        uintptr_t func_addr = 0;
         uintptr_t func_4110 = slide + k4110_FuncVA_arm64;
         uint32_t head_insn = *(volatile uint32_t *)func_4110;
 
         if (head_insn == 0xB9400C08u) {
-            if (install_arm64_trampoline(func_4110, hook))
-                ARLOG("4.1.10 arm64 trampoline 安装成功");
+            // 进一步验证完整 5 条指令特征码（避免误判）
+            uint32_t *p = (uint32_t *)func_4110;
+            if (p[1] == 0x5284E249u && p[2] == 0x6B09011Fu &&
+                p[3] == 0x1A9F17E0u && p[4] == 0xD65F03C0u) {
+                func_addr = func_4110;
+                ARLOG("快速路径命中: 0x%lx", (unsigned long)func_addr);
+            }
+        }
+
+        // 2. 快速路径失败 → 尝试 4.1.9 slot
+        if (func_addr == 0) {
+            void **slot = (void **)(slide + k419_SlotVA_arm64);
+            // 简单验证：检查 slot 周围是否在 __DATA 段（不严格）
+            // 先记录，后面如果特征码搜索也失败再尝试 slot
+        }
+
+        // 3. 特征码搜索（兜底）
+        if (func_addr == 0 && has_text) {
+            ARLOG("快速路径未命中，开始特征码搜索...");
+            uintptr_t found = scan_isRevokeMessage_arm64(text_start, text_size);
+            if (found) {
+                func_addr = found;
+                ARLOG("特征码搜索找到: 0x%lx (offset 0x%lx)",
+                      (unsigned long)func_addr, (unsigned long)(func_addr - slide));
+            }
+        }
+
+        // 4. 安装 trampoline
+        if (func_addr != 0) {
+            if (install_arm64_trampoline(func_addr, hook)) {
+                ARLOG("arm64 trampoline 安装成功");
+                installed = 1;
+            }
         } else {
+            // 5. 最后尝试 4.1.9 slot 方式
             void **slot = (void **)(slide + k419_SlotVA_arm64);
             uintptr_t page = (uintptr_t)slot & ~(uintptr_t)0x3FFF;
-            vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, 0, VM_PROT_READ | VM_PROT_WRITE);
-            *slot = (void *)hook;
-            ARLOG("4.1.9 arm64 slot 写入成功");
+            kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000,
+                                          0, VM_PROT_READ | VM_PROT_WRITE);
+            if (kr == KERN_SUCCESS) {
+                *slot = (void *)hook;
+                ARLOG("4.1.9 arm64 slot 写入（fallback）");
+                installed = 1;
+            }
         }
 
 #elif defined(__x86_64__)
+        uintptr_t func_addr = 0;
         uintptr_t func_4110_x86 = slide + k4110_FuncVA_x86_64;
         uintptr_t func_419_x86  = slide + k419_FuncVA_x86_64;
         const uint32_t kFuncHead = 0xE5894855u;
 
+        // 1. 快速路径
         if (*(volatile uint32_t *)func_4110_x86 == kFuncHead) {
-            if (install_x86_64_trampoline(func_4110_x86, hook))
-                ARLOG("4.1.10 x86_64 trampoline 安装成功");
+            func_addr = func_4110_x86;
         } else if (*(volatile uint32_t *)func_419_x86 == kFuncHead) {
-            if (install_x86_64_trampoline(func_419_x86, hook))
-                ARLOG("4.1.9 x86_64 trampoline 安装成功");
-        } else {
-            ARLOG("ERROR: x86_64 函数地址未匹配");
+            func_addr = func_419_x86;
+        }
+
+        // 2. 特征码搜索
+        if (func_addr == 0 && has_text) {
+            ARLOG("快速路径未命中，开始特征码搜索...");
+            uintptr_t found = scan_isRevokeMessage_x86_64(text_start, text_size);
+            if (found) {
+                func_addr = found;
+                ARLOG("特征码搜索找到: 0x%lx (offset 0x%lx)",
+                      (unsigned long)func_addr, (unsigned long)(func_addr - slide));
+            }
+        }
+
+        // 3. 安装 trampoline
+        if (func_addr != 0) {
+            if (install_x86_64_trampoline(func_addr, hook)) {
+                ARLOG("x86_64 trampoline 安装成功");
+                installed = 1;
+            }
         }
 #endif
-        ARLOG("就绪，等待撤回消息...");
+
+        if (!installed) {
+            ARLOG("ERROR: hook 安装失败 - 微信版本 %s (build %s) 未适配",
+                  short_ver, build);
+            notify_install_failed(short_ver, build, known_build);
+        } else {
+            ARLOG("就绪，等待撤回消息...");
+        }
     });
 }
 HOOK_SOURCE
@@ -653,10 +950,6 @@ verify_install() {
 do_install() {
     print_banner
     check_environment
-
-    VERSION=$(defaults read "$WECHAT_APP/Contents/Info.plist" CFBundleVersion 2>/dev/null)
-    SHORT_VER=$(defaults read "$WECHAT_APP/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null)
-    echo "[INFO] 微信版本: $SHORT_VER ($VERSION)"
 
     # 检查是否已安装
     if [ -f "$DYLIB_DST" ]; then
