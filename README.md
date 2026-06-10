@@ -1,6 +1,6 @@
 # WeChatIntercept
 
-macOS 微信防撤回工具，持续更新，欢迎 star。
+macOS 微信防撤回工具，持续更新，欢迎共建和 star。
 
 ## 最新版本
 
