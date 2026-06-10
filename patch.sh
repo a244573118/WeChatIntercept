@@ -1,30 +1,9 @@
 #!/bin/bash
-#
-# ============================================================
 # 微信防撤回一键安装脚本
-# ============================================================
-#
-# 适用版本: 微信 4.1.9 (CFBundleVersion: 268602)
-#           微信 4.1.10 (CFBundleVersion: 268824)
-# 适用平台: macOS (Apple Silicon + Intel)
-# 依赖工具: clang, codesign, python3 (macOS 系统自带)
-#
-# 使用方法:
-#   chmod +x patch.sh
-#   ./patch.sh            # 安装防撤回
-#   ./patch.sh --uninstall # 卸载（恢复原始微信）
-#
-# 原理:
-#   通过 DYLD 注入一个运行时 hook 动态库，
-#   拦截微信的 isRevokeMessage() 函数，
-#   区分对方撤回和自己撤回：
-#   - 对方撤回 → 返回 false（消息保留不被删除）
-#   - 自己撤回 → 返回 true（正常处理，不会闪退）
-#
-#   4.1.9:  通过写入内建 hook dispatch slot (BSS 区域) 实现
-#   4.1.10: dispatch slot 机制已移除，改用 inline trampoline patch
-#
-# ============================================================
+# 适用：微信 4.1.x (Apple Silicon + Intel)
+# 依赖：clang / codesign / python3 (macOS 自带)
+# 用法：./patch.sh [--monitor-install|--uninstall|--debug|--help]
+# 详细原理 / 版本适配指南见 doc/reverse-engineering-guide.md
 
 set -e
 
@@ -125,7 +104,6 @@ compile_dylib() {
 #import <stdio.h>
 #import <sys/stat.h>
 
-// ── 日志 ─────────────────────────────────────────────────────
 static FILE *g_logFile = NULL;
 
 static void log_open(void) {
@@ -136,27 +114,24 @@ static void log_open(void) {
     if (g_logFile) { fprintf(g_logFile, "[AntiRevoke] " fmt "\n", ##__VA_ARGS__); fflush(g_logFile); } \
 } while(0)
 
-// ── 常量 ─────────────────────────────────────────────────────
+// 注意：Resources/wechat.dylib 是核心库（~140MB），Frameworks/ 下是 stub（~16KB），不能 hook 错
 static const char    *kDylibSuffix_Resources  = "Resources/wechat.dylib";
 static const char    *kDylibSuffix_Frameworks = "Frameworks/wechat.dylib";
-static const int32_t  kRevokeType    = 0x2712;   // 10002
+static const int32_t  kRevokeType    = 0x2712;   // isRevokeMessage 比较的 MsgType 常量
 
-// 配置文件路径：~/.config/antirevoke/config
-// 格式：每行一个 key=value
-// notify=1  开启通知（默认）
-// notify=0  关闭通知
-static char g_config_path[512] = {0};
 
-// ── 版本地址表 ───────────────────────────────────────────────
+
+// 已知 build 的硬编码地址（特征码搜索失败时的兜底）
 static const uintptr_t k419_SlotVA_arm64   = 0x9301838;
 static const uintptr_t k4110_FuncVA_arm64  = 0x44FFE20;
 static const uintptr_t k4110_FuncVA_x86_64 = 0x4B4E9A0;
 static const uintptr_t k419_FuncVA_x86_64  = 0x4AF08D0;
 
-// ── 获取当前登录用户 ID ──────────────────────────────────────
+// 当前登录用户 wxid，用于区分"自己撤回"vs"对方撤回"
 static char g_my_id[64] = {0};
 static _Bool g_my_id_loaded = 0;
 
+// 通过取 ~/Library/Containers/.../app_data/login/ 下最新修改的目录名判定
 static void load_my_user_id(void) {
     if (g_my_id_loaded) return;
     g_my_id_loaded = 1;
@@ -202,31 +177,10 @@ static void load_my_user_id(void) {
     }
 }
 
-// ── 配置 ─────────────────────────────────────────────────────
-static void init_config_path(void) {
-    const char *home = getenv("HOME");
-    if (home) {
-        snprintf(g_config_path, sizeof(g_config_path), "%s/.config/antirevoke/config", home);
-    }
-}
 
-static _Bool is_notify_enabled(void) {
-    if (g_config_path[0] == '\0') return 1;  // 配置路径未初始化，默认开启
-    FILE *f = fopen(g_config_path, "r");
-    if (!f) return 1;  // 配置文件不存在，默认开启
-    char line[128];
-    _Bool enabled = 1;
-    while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, "notify=0", 8) == 0) { enabled = 0; break; }
-    }
-    fclose(f);
-    return enabled;
-}
 
 static void send_notification(const char *text) {
-    if (!is_notify_enabled()) return;
-
-    // 对英文双引号和反斜杠做转义
+    // osascript 对 " 和 \ 敏感，必须转义
     char *escaped = (char *)malloc(1024);
     if (!escaped) return;
     int j = 0;
@@ -247,19 +201,19 @@ static void send_notification(const char *text) {
     });
 }
 
-// ── 检查 sender 偏移是否仍有效 ───────────────────────────────
-// 仅检查前 4 字节是否为可打印 ASCII（微信 ID 总以可打印字符开头）
-// 缩小检查范围避免误判撤回流程中的二次调用（其 sender 可能是 std::string 元数据）
+// 微信小版本升级 sender 偏移可能漂移；仅检查前 4 字节是否可打印 ASCII
+// 失效时静默放行（return 1），不影响微信内部撤回流程；阈值后弹一次催更新通知
 static _Bool is_valid_sender(const char *s) {
-    if (s[0] == '\0') return 1;  // 空字符串 = 自己撤回确认
+    if (s[0] == '\0') return 1;  // 空 = 自己撤回的内部回调
     for (int i = 0; i < 4; i++) {
         unsigned char c = (unsigned char)s[i];
-        if (c < 0x20 || c > 0x7E) return 0;  // 非可打印字符
+        if (c < 0x20 || c > 0x7E) return 0;
     }
     return 1;
 }
 
-// ── hook 函数 ────────────────────────────────────────────────
+// 入口：被微信 isRevokeMessage 替换。
+// 返回 1 = 该消息是撤回（按原行为处理）；返回 0 = 阻止微信删除消息
 __attribute__((visibility("default")))
 _Bool hook_isRevokeMessage(void *msg) {
     if (msg == NULL) return 0;
@@ -271,13 +225,8 @@ _Bool hook_isRevokeMessage(void *msg) {
 
     const char *sender = (const char *)((uint8_t *)msg + 0x18);
 
-    // 检查 sender 偏移是否仍有效（前 4 字节必须可打印 ASCII）
-    // 失效时静默放行（return 1），避免影响撤回流程的内部状态
-    // 真正的偏移失效会持续触发，达到阈值时弹一次"催更新"通知
     if (!is_valid_sender(sender)) {
         ARLOG("WARN: sender 区域非可打印 ASCII，跳过此次调用");
-
-        // 累计失效次数，达到阈值时弹通知催更新（仅一次）
         static int g_invalid_count = 0;
         static _Bool g_warned = 0;
         g_invalid_count++;
@@ -294,24 +243,24 @@ _Bool hook_isRevokeMessage(void *msg) {
                 });
             }
         }
-        return 1;  // 静默放行，不影响业务流程
+        return 1;
     }
 
-    // 自己撤回 → 放行
+    // 自己撤回 → 放行（让微信正常处理）
     if (sender[0] == '\0') return 1;
     if (g_my_id[0] != '\0' && strncmp(sender, g_my_id, strlen(g_my_id)) == 0) return 1;
 
     // 对方撤回 → 阻止
     ARLOG("拦截: %.20s", sender);
 
-    // 提取通知内容
+    // 从 msg+0x130 (ptr) / +0x138 (len) 读撤回 XML
     char notify_text[256] = {0};
 
 #if defined(__arm64__) || defined(__aarch64__)
-    // arm64：从 msg+0x130 读取 XML body，提取 replacemsg（含用户昵称）
     uint64_t xml_ptr = *(uint64_t *)((uint8_t *)msg + 0x130);
     uint64_t xml_len = *(uint64_t *)((uint8_t *)msg + 0x138);
     if (xml_ptr > 0x100000000ULL && xml_len > 0 && xml_len < 4096) {
+        // CDATA 内容形如 "Macanzy" 撤回了一条消息
         const char *xml_body = (const char *)xml_ptr;
         const char *cs = strstr(xml_body, "<![CDATA[");
         const char *ce = cs ? strstr(cs, "]]>") : NULL;
@@ -326,11 +275,91 @@ _Bool hook_isRevokeMessage(void *msg) {
     }
 #endif
 
-    char content[512] = {0};
-    if (notify_text[0] != '\0')
-        snprintf(content, sizeof(content), "拦截到%s", notify_text);
-    else
-        snprintf(content, sizeof(content), "拦截到 %s 撤回了一条消息", sender);
+    // 反查 lldb monitor 写入的消息缓存（/tmp/wechat_msg_cache.tsv）
+    char orig_content[512] = {0};
+    _Bool has_orig = 0;
+#if defined(__arm64__) || defined(__aarch64__)
+    if (xml_ptr > 0x100000000ULL && xml_len > 0 && xml_len < 4096) {
+        const char *xml_body = (const char *)xml_ptr;
+        const char *p = strstr(xml_body, "<newmsgid>");
+        uint64_t newmsgid = 0;
+        if (p) {
+            p += 10;
+            int digits = 0;
+            while (*p >= '0' && *p <= '9' && digits < 20) {
+                newmsgid = newmsgid * 10 + (uint64_t)(*p - '0');
+                p++; digits++;
+            }
+            if (digits == 0) newmsgid = 0;
+        }
+        if (newmsgid != 0) {
+            FILE *cf = fopen("/tmp/wechat_msg_cache.tsv", "r");
+            if (cf) {
+                char line[1024];
+                while (fgets(line, sizeof(line), cf)) {
+                    char *t1 = strchr(line, '\t');
+                    if (!t1) continue;
+                    *t1 = '\0';
+                    uint64_t row_svrid = 0;
+                    int d2 = 0;
+                    for (const char *q = line; *q >= '0' && *q <= '9' && d2 < 20; q++, d2++)
+                        row_svrid = row_svrid * 10 + (uint64_t)(*q - '0');
+                    if (d2 == 0 || row_svrid != newmsgid) continue;
+                    char *t2 = strchr(t1 + 1, '\t');
+                    if (!t2) continue;
+                    char *nl = strchr(t2 + 1, '\n');
+                    if (nl) *nl = '\0';
+                    strncpy(orig_content, t2 + 1, sizeof(orig_content) - 1);
+                    has_orig = (orig_content[0] != '\0');
+                }
+                fclose(cf);
+            }
+            ARLOG("撤回反查: svrid=%llu %s",
+                  (unsigned long long)newmsgid, has_orig ? "命中" : "未命中");
+        }
+    }
+#endif
+
+    // 非文本消息描述模板 → 占位符
+    if (has_orig) {
+        struct { const char *needle; const char *replace; } kReplaces[] = {
+            {"发了一张图片", "[图片]"}, {"发了一段视频", "[视频]"},
+            {"发了一个文件", "[文件]"}, {"发了一段语音", "[语音]"},
+            {"发了一条语音消息", "[语音]"}, {"发了一个表情", "[表情]"},
+            {"发了一个视频号", "[视频号]"}, {"发了一张名片", "[名片]"},
+            {"发了一个位置", "[位置]"}, {"发了一个红包", "[红包]"},
+            {"发了一个链接", "[链接]"}, {"发了一个小程序", "[小程序]"},
+            {NULL, NULL},
+        };
+        for (int i = 0; kReplaces[i].needle; i++) {
+            if (strstr(orig_content, kReplaces[i].needle)) {
+                strncpy(orig_content, kReplaces[i].replace, sizeof(orig_content) - 1);
+                break;
+            }
+        }
+    }
+
+    // 从 notify_text 抽纯昵称：剥 "撤回了" 后缀 + 首尾空格 + 英文双引号
+    char nick[128] = {0};
+    if (notify_text[0] != '\0') {
+        const char *p = strstr(notify_text, "撤回了");
+        if (p && p > notify_text) {
+            const char *start = notify_text;
+            size_t nlen = (size_t)(p - notify_text);
+            while (nlen > 0 && start[nlen - 1] == ' ') nlen--;
+            while (nlen > 0 && *start == ' ') { start++; nlen--; }
+            if (nlen >= 2 && start[0] == '"' && start[nlen - 1] == '"') { start++; nlen -= 2; }
+            if (nlen > 0 && nlen < sizeof(nick)) { memcpy(nick, start, nlen); nick[nlen] = '\0'; }
+        }
+    }
+    const char *who = (nick[0] != '\0') ? nick : sender;
+
+    char content[768] = {0};
+    if (has_orig) {
+        snprintf(content, sizeof(content), "拦截到「%s」撤回了一条消息：%s", who, orig_content);
+    } else {
+        snprintf(content, sizeof(content), "拦截到「%s」撤回了一条消息", who);
+    }
 
     send_notification(content);
 
@@ -363,8 +392,6 @@ static uintptr_t find_wechat_slide(const struct mach_header **out_header) {
     return fallback;
 }
 
-// ── 解析 wechat.dylib 的 __TEXT 段范围 ───────────────────────
-// 返回 1 = 成功，0 = 失败
 static _Bool find_text_segment(const struct mach_header *header, uintptr_t slide,
                                 uintptr_t *out_start, size_t *out_size) {
     if (!header) return 0;
@@ -403,10 +430,7 @@ static _Bool find_text_segment(const struct mach_header *header, uintptr_t slide
     return 0;
 }
 
-// ── 特征码搜索：在 __TEXT 段中查找 isRevokeMessage 函数 ──────
-// arm64 特征：5 条指令的 isRevokeMessage（无 dispatch slot 的 4.1.10 形态）
-//   LDR W8, [X0, #0xC]; MOV W9, #0x2712; CMP W8, W9; CSET W0, EQ; RET
-// 返回函数 VA（slide + offset），未找到返回 0
+// arm64 isRevokeMessage 特征码：LDR W8,[X0,#C]; MOV W9,#0x2712; CMP; CSET; RET
 static uintptr_t scan_isRevokeMessage_arm64(uintptr_t text_start, size_t text_size) {
     static const uint32_t pattern[5] = {
         0xB9400C08u, 0x5284E249u, 0x6B09011Fu, 0x1A9F17E0u, 0xD65F03C0u
@@ -427,11 +451,7 @@ static uintptr_t scan_isRevokeMessage_arm64(uintptr_t text_start, size_t text_si
     return 0;
 }
 
-// x86_64 特征：完整函数（16 字节）
-//   55 48 89 E5 (push rbp; mov rbp,rsp)
-//   81 7F 0C 12 27 00 00 (cmp [rdi+0xC], 0x2712)
-//   0F 94 C0 (sete al)
-//   5D C3 (pop rbp; ret)
+// x86_64 isRevokeMessage 特征码
 static uintptr_t scan_isRevokeMessage_x86_64(uintptr_t text_start, size_t text_size) {
     static const uint8_t pattern[] = {
         0x55, 0x48, 0x89, 0xE5,
@@ -451,8 +471,6 @@ static uintptr_t scan_isRevokeMessage_x86_64(uintptr_t text_start, size_t text_s
     return 0;
 }
 
-// ── 版本检测 ─────────────────────────────────────────────────
-// 已知支持的 build：4.1.9 (268602)、4.1.10 (268824)
 static const char *kKnownBuilds[] = { "268602", "268824", NULL };
 
 static _Bool is_known_build(const char *build) {
@@ -463,7 +481,6 @@ static _Bool is_known_build(const char *build) {
     return 0;
 }
 
-// 读取 Info.plist 中的 CFBundleVersion + CFBundleShortVersionString
 static void read_wechat_version(char *short_ver, size_t short_sz,
                                   char *build, size_t build_sz) {
     short_ver[0] = '\0';
@@ -477,7 +494,6 @@ static void read_wechat_version(char *short_ver, size_t short_sz,
     }
 }
 
-// ── 内存保护工具 ─────────────────────────────────────────────
 static kern_return_t make_rw(uintptr_t addr, size_t len) {
     uintptr_t page = addr & ~(uintptr_t)0x3FFF;
     size_t sz = (addr + len - page + 0x3FFF) & ~(size_t)0x3FFF;
@@ -491,7 +507,7 @@ static kern_return_t make_rx(uintptr_t addr, size_t len) {
                       VM_PROT_READ | VM_PROT_EXECUTE);
 }
 
-// ── arm64 inline trampoline（20 字节）─────────────────────────
+// arm64: LDR X16,#8; BR X16; <addr64>; NOP  — 共 20 字节覆盖原函数入口
 static _Bool install_arm64_trampoline(uintptr_t func_addr, uintptr_t hook_addr) {
     kern_return_t kr = make_rw(func_addr, 20);
     if (kr != KERN_SUCCESS) { ARLOG("ERROR: make_rw kr=%d", kr); return 0; }
@@ -512,7 +528,7 @@ static _Bool install_arm64_trampoline(uintptr_t func_addr, uintptr_t hook_addr) 
     return 1;
 }
 
-// ── x86_64 inline trampoline（16 字节）───────────────────────
+// x86_64: JMP [RIP+0]; <addr64>; NOP; RET  — 共 16 字节
 static _Bool install_x86_64_trampoline(uintptr_t func_addr, uintptr_t hook_addr) {
     kern_return_t kr = make_rw(func_addr, 16);
     if (kr != KERN_SUCCESS) { ARLOG("ERROR: x86_64 make_rw kr=%d", kr); return 0; }
@@ -532,9 +548,7 @@ static _Bool install_x86_64_trampoline(uintptr_t func_addr, uintptr_t hook_addr)
     return 1;
 }
 
-// ── Hook 安装失败时通知用户 ─────────────────────────────────
 static void notify_install_failed(const char *short_ver, const char *build, _Bool known_build) {
-    if (!is_notify_enabled()) return;
 
     char *cmd = (char *)malloc(2048);
     if (!cmd) return;
@@ -543,20 +557,17 @@ static void notify_install_failed(const char *short_ver, const char *build, _Boo
     char body[512];
 
     if (known_build) {
-        // 已知 build 但仍失败（极罕见）
         snprintf(title, sizeof(title), "WeChatIntercept 异常");
         snprintf(body, sizeof(body),
             "已知版本 %s (%s) hook 安装失败，请查看 /tmp/antirevoke_debug.log",
             short_ver, build);
     } else {
-        // 未知 build：可能是版本变化或仅 build 号变化
         snprintf(title, sizeof(title), "WeChatIntercept 需更新");
         snprintf(body, sizeof(body),
             "微信版本 %s (build %s) 未适配，防撤回功能已失效。请前往 GitHub 获取最新脚本",
             short_ver, build);
     }
 
-    // 转义 body 中的双引号和反斜杠
     char escaped[1024];
     int j = 0;
     for (int i = 0; body[i] && j < (int)sizeof(escaped) - 2; i++) {
@@ -583,10 +594,8 @@ static void hook_init(void) {
         dispatch_get_main_queue(), ^{
 
         log_open();
-        init_config_path();
         ARLOG("hook_init 启动");
 
-        // 读取微信版本
         char short_ver[32] = {0};
         char build[32] = {0};
         read_wechat_version(short_ver, sizeof(short_ver), build, sizeof(build));
@@ -602,7 +611,6 @@ static void hook_init(void) {
             return;
         }
 
-        // 解析 __TEXT 段范围（用于特征码搜索）
         uintptr_t text_start = 0;
         size_t text_size = 0;
         _Bool has_text = find_text_segment(header, slide, &text_start, &text_size);
@@ -613,13 +621,12 @@ static void hook_init(void) {
         _Bool installed = 0;
 
 #if defined(__arm64__) || defined(__aarch64__)
-        // 1. 先尝试硬编码地址（快速路径）
+        // 三级查找：硬编码快速路径 → 特征码搜索 → 4.1.9 slot fallback
         uintptr_t func_addr = 0;
         uintptr_t func_4110 = slide + k4110_FuncVA_arm64;
         uint32_t head_insn = *(volatile uint32_t *)func_4110;
 
         if (head_insn == 0xB9400C08u) {
-            // 进一步验证完整 5 条指令特征码（避免误判）
             uint32_t *p = (uint32_t *)func_4110;
             if (p[1] == 0x5284E249u && p[2] == 0x6B09011Fu &&
                 p[3] == 0x1A9F17E0u && p[4] == 0xD65F03C0u) {
@@ -628,14 +635,6 @@ static void hook_init(void) {
             }
         }
 
-        // 2. 快速路径失败 → 尝试 4.1.9 slot
-        if (func_addr == 0) {
-            void **slot = (void **)(slide + k419_SlotVA_arm64);
-            // 简单验证：检查 slot 周围是否在 __DATA 段（不严格）
-            // 先记录，后面如果特征码搜索也失败再尝试 slot
-        }
-
-        // 3. 特征码搜索（兜底）
         if (func_addr == 0 && has_text) {
             ARLOG("快速路径未命中，开始特征码搜索...");
             uintptr_t found = scan_isRevokeMessage_arm64(text_start, text_size);
@@ -646,14 +645,13 @@ static void hook_init(void) {
             }
         }
 
-        // 4. 安装 trampoline
         if (func_addr != 0) {
             if (install_arm64_trampoline(func_addr, hook)) {
                 ARLOG("arm64 trampoline 安装成功");
                 installed = 1;
             }
         } else {
-            // 5. 最后尝试 4.1.9 slot 方式
+            // 4.1.9 slot fallback
             void **slot = (void **)(slide + k419_SlotVA_arm64);
             uintptr_t page = (uintptr_t)slot & ~(uintptr_t)0x3FFF;
             kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000,
@@ -671,14 +669,12 @@ static void hook_init(void) {
         uintptr_t func_419_x86  = slide + k419_FuncVA_x86_64;
         const uint32_t kFuncHead = 0xE5894855u;
 
-        // 1. 快速路径
         if (*(volatile uint32_t *)func_4110_x86 == kFuncHead) {
             func_addr = func_4110_x86;
         } else if (*(volatile uint32_t *)func_419_x86 == kFuncHead) {
             func_addr = func_419_x86;
         }
 
-        // 2. 特征码搜索
         if (func_addr == 0 && has_text) {
             ARLOG("快速路径未命中，开始特征码搜索...");
             uintptr_t found = scan_isRevokeMessage_x86_64(text_start, text_size);
@@ -689,7 +685,6 @@ static void hook_init(void) {
             }
         }
 
-        // 3. 安装 trampoline
         if (func_addr != 0) {
             if (install_x86_64_trampoline(func_addr, hook)) {
                 ARLOG("x86_64 trampoline 安装成功");
@@ -816,6 +811,7 @@ resign_app() {
     echo "[INFO] 重签名（注入 entitlements 绕过 Library Validation）..."
 
     # 创建 entitlements 文件
+    # get-task-allow 允许 lldb attach（用于 monitor.sh 写消息缓存供撤回反查）
     local ENT_FILE="/tmp/antirevoke_ent.plist"
     cat > "$ENT_FILE" << 'ENTITLEMENTS'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -825,6 +821,8 @@ resign_app() {
     <key>com.apple.security.cs.disable-library-validation</key>
     <true/>
     <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.get-task-allow</key>
     <true/>
 </dict>
 </plist>
@@ -968,12 +966,7 @@ do_install() {
     resign_app
     verify_install
 
-    # 创建默认配置（开启通知）
-    local CONFIG_DIR="$HOME/.config/antirevoke"
-    mkdir -p "$CONFIG_DIR"
-    if [ ! -f "$CONFIG_DIR/config" ]; then
-        echo "notify=1" > "$CONFIG_DIR/config"
-    fi
+
 
     echo ""
     echo "=============================="
@@ -982,12 +975,8 @@ do_install() {
     echo ""
     echo " 功能: 对方撤回的消息将保留可见"
     echo "       自己撤回消息正常工作"
-    echo ""
-    echo " 通知开关:"
-    echo "   $0 openNotify   开启撤回通知"
-    echo "   $0 closeNotify  关闭撤回通知"
-    echo ""
-    echo " 卸载: $0 --uninstall"
+     echo ""
+     echo " 卸载: $0 --uninstall"
     echo ""
 }
 
@@ -1074,59 +1063,659 @@ do_uninstall() {
     echo ""
 }
 
-CONFIG_DIR="$HOME/.config/antirevoke"
-CONFIG_FILE="$CONFIG_DIR/config"
+# ======================== 消息监听（撤回原文）========================
 
-do_open_notify() {
-    mkdir -p "$CONFIG_DIR"
-    if grep -q "^notify=" "$CONFIG_FILE" 2>/dev/null; then
-        sed -i '' 's/^notify=.*/notify=1/' "$CONFIG_FILE"
-    else
-        echo "notify=1" >> "$CONFIG_FILE"
-    fi
-    echo "[INFO] 撤回通知已开启"
+# 释放内嵌脚本到 MONITOR_INSTALL_DIR
+deploy_monitor_files() {
+    MONITOR_INSTALL_DIR="/tmp/wechatintercept_monitor"
+    mkdir -p "$MONITOR_INSTALL_DIR"
+
+    # wechat_msg_monitor.py
+    cat > "$MONITOR_INSTALL_DIR/wechat_msg_monitor.py" << 'MONITOR_PY'
+# -*- coding: utf-8 -*-
+"""
+WeChat 消息监听器（lldb Python 脚本）
+在 wechat.dylib __TEXT 段扫描 CMessageWrap 虚方法特征码，
+断点命中时读消息字段写入 TSV 缓存供 dylib 反查撤回原文。
+用法：./monitor.sh 或 ./monitor.sh --install
+"""
+
+import lldb
+import struct
+import datetime
+
+# CMessageWrap 虚方法（257712）特征码（4.1.10 实测）
+# PREFIX 4条 + 通配 bl(4字节) + SUFFIX 1条
+PATTERN_PREFIX = bytes.fromhex("f44fbea9" "fd7b01a9" "fd430091" "f30301aa")
+PATTERN_SUFFIX = bytes.fromhex("683a40f9")
+PATTERN_GAP = 4
+
+# 消息对象字段偏移（4.1.10 验证；微信升级后可能变化）
+OFF_FLAG1       = 0x28
+OFF_FLAG2       = 0x2c
+OFF_CONTENT_PTR = 0x40   # wrapper ptr; wrapper+0x00 → content char*
+OFF_CREATE_TIME = 0x48
+OFF_MSG_LOCAL   = 0x4c
+OFF_MSG_SVR     = 0x50   # int64, 与撤回 XML <newmsgid> 对应
+OFF_FROM_PTR    = 0x08   # wrapper ptr; wrapper+0x08 → wxid char*
+
+WRAPPER_DATA_PTR = 0x08
+
+_g_msg_count = 0
+_g_seen_svrid = set()
+_g_debug_dump = False
+
+# 缓存文件：dylib 反查撤回原文用。svrid 十进制，字段 \t 分隔，原子 rename 写入
+CACHE_FILE = "/tmp/wechat_msg_cache.tsv"
+_CACHE_MAX_LINES = 500
+_g_cache_lines = []
+
+
+def _sanitize_field(s):
+    if not s:
+        return ""
+    return s.replace("\t", " ").replace("\n", " ").replace("\r", " ")
+
+
+def _strip_sender_prefix(content):
+    # 微信 +0x40 存的是 "<昵称> : <正文>" 格式，剥掉前缀只留正文
+    if not content:
+        return content
+    idx = content.find(" : ")
+    if idx > 0 and idx < 64:  # 昵称不会超过 64 字符
+        return content[idx + 3:]
+    return content
+
+
+def _is_valid_content(stripped, from_user):
+    if not stripped or len(stripped) < 2:
+        return False
+    if stripped == from_user:
+        return False
+    if stripped.startswith("<"):
+        return False
+    return True
+
+
+def _cache_append(svrid, from_user, content):
+    if svrid == 0 or not content:
+        return
+    try:
+        body = _strip_sender_prefix(content)
+        line = "{}\t{}\t{}\n".format(
+            svrid,
+            _sanitize_field(from_user)[:63],
+            _sanitize_field(body)[:511],
+        )
+        _g_cache_lines.append(line)
+        if len(_g_cache_lines) > _CACHE_MAX_LINES:
+            del _g_cache_lines[: len(_g_cache_lines) - _CACHE_MAX_LINES]
+
+        # 原子写，避免 dylib 读到半行
+        tmp = CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8", errors="replace") as f:
+            f.writelines(_g_cache_lines)
+        import os
+        os.replace(tmp, CACHE_FILE)
+    except Exception as e:
+        print("    [cache] write failed: {}".format(e))
+
+
+def _read_mem(process, addr, size):
+    if addr == 0:
+        return None
+    err = lldb.SBError()
+    data = process.ReadMemory(addr, size, err)
+    if not err.Success():
+        return None
+    return data
+
+
+def _read_u32(process, addr):
+    data = _read_mem(process, addr, 4)
+    if data is None:
+        return None
+    return struct.unpack("<I", data)[0]
+
+
+def _read_u64(process, addr):
+    data = _read_mem(process, addr, 8)
+    if data is None:
+        return None
+    return struct.unpack("<Q", data)[0]
+
+
+def _read_cstring(process, addr, max_len=256):
+    if addr == 0:
+        return ""
+    data = _read_mem(process, addr, max_len)
+    if data is None:
+        return ""
+    nul = data.find(b"\x00")
+    if nul >= 0:
+        data = data[:nul]
+    try:
+        return data.decode("utf-8", errors="replace")
+    except Exception:
+        return repr(data)
+
+
+def _read_std_string_via_wrapper(process, wrapper_ptr):
+    # wrapper 结构: +0x00 vtable, +0x08 data ptr
+    if wrapper_ptr == 0:
+        return ""
+    data_ptr = _read_u64(process, wrapper_ptr + WRAPPER_DATA_PTR)
+    if data_ptr is None or data_ptr == 0:
+        return ""
+
+    # 简化：不区分 char*/SSO，直接当 C 字符串读
+    s = _read_cstring(process, data_ptr, max_len=512)
+    return s
+
+
+def _read_std_string_inplace(process, addr):
+    # libc++ std::string 24字节布局: LSB of byte[23] == 0 → SSO, == 1 → heap
+    data = _read_mem(process, addr, 24)
+    if data is None:
+        return ""
+    last_byte = data[23]
+    if last_byte & 0x01 == 0:
+        # SSO（最低位=0）
+        size = last_byte >> 1
+        if size > 22:
+            return ""
+        return data[:size].decode("utf-8", errors="replace")
+    else:
+        # 长字符串
+        ptr = struct.unpack("<Q", data[0:8])[0]
+        size = struct.unpack("<Q", data[8:16])[0]
+        if size > 4096:
+            return ""
+        body = _read_mem(process, ptr, size)
+        if body is None:
+            return ""
+        return body.decode("utf-8", errors="replace")
+
+
+
+def _try_read_content(process, msg_obj):
+    # +0x40 是 std::string inplace（libc++ [data_ptr][size][cap|0x80...]）
+    # 注意：断点命中瞬间 data_ptr 指向的内存可能还没就绪（时序问题），
+    # 所以尝试两次读取：第一次失败就 fallback，最后再试一次
+    def _try_str40():
+        # +0x40 存的是指针 → 指向 std::string 结构
+        ptr40 = _read_u64(process, msg_obj + 0x40)
+        if not ptr40 or ptr40 < 0x100000000 or ptr40 > 0x10000000000:
+            return ""
+        raw = _read_mem(process, ptr40, 24)
+        if not raw or len(raw) < 24:
+            return ""
+        dp = struct.unpack("<Q", raw[0:8])[0]
+        sz = struct.unpack("<Q", raw[8:16])[0]
+        # 长字符串：dp 是堆指针，sz 是长度
+        if 0x100000000 < dp < 0x10000000000 and 0 < sz < 4096:
+            text = _read_cstring(process, dp, min(int(sz) + 1, 512))
+            if text and len(text) >= 2:
+                return text
+        # SSO：数据直接在 raw[0:22]
+        nul = raw.find(b"\x00", 0, 22)
+        sso_data = raw[:nul] if nul >= 0 else raw[:22]
+        if sso_data and len(sso_data) >= 2:
+            try:
+                return sso_data.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                pass
+        return ""
+
+    t = _try_str40()
+    if t:
+        return (t, "+0x40(str)")
+
+    return ("", "")
+
+
+def on_msg_hit(frame, bp_loc, dict_):
+    # 返回 False = 自动 continue（不停在 lldb）
+    global _g_msg_count, _g_seen_svrid
+
+    process = frame.GetThread().GetProcess()
+
+    # x19 = msg obj; callee-saved, 在 +12 (mov x19,x1) 后已就绪
+    x19 = frame.FindRegister("x19").GetValueAsUnsigned()
+    if x19 == 0:
+        return False
+
+    msg_obj = x19
+    if msg_obj < 0x100000000 or msg_obj > 0x1000000000000:
+        return False
+
+    create_time = _read_u32(process, msg_obj + OFF_CREATE_TIME)
+    msg_local = _read_u32(process, msg_obj + OFF_MSG_LOCAL)
+    msg_svr_lo = _read_u32(process, msg_obj + OFF_MSG_SVR)
+    msg_svr_hi = _read_u32(process, msg_obj + OFF_MSG_SVR + 4)
+    if create_time is None or msg_svr_lo is None or msg_svr_hi is None:
+        return False
+    msg_svr = (msg_svr_hi << 32) | msg_svr_lo
+
+    if create_time < 1577836800 or create_time > 1893456000:  # 2020~2030
+        return False
+
+    if msg_svr in _g_seen_svrid:
+        return False
+    if msg_svr != 0:
+        _g_seen_svrid.add(msg_svr)
+        if len(_g_seen_svrid) > 1000:
+            _g_seen_svrid = set(list(_g_seen_svrid)[-500:])
+
+    # from: +0x08 wrapper, wrapper+0x08 才是字符串
+    from_wrapper = _read_u64(process, msg_obj + OFF_FROM_PTR)
+    from_user = _read_std_string_via_wrapper(process, from_wrapper) if from_wrapper else ""
+
+    flag1 = _read_u32(process, msg_obj + OFF_FLAG1)
+    flag2 = _read_u32(process, msg_obj + OFF_FLAG2)
+    subtype_vtbl = _read_u64(process, msg_obj + 0x10)
+
+    # flag2=1: +0x40 → ptr → std::string（已验证）
+    # flag2=2: 不同类结构，尝试扩大范围搜索
+    content, content_off = _try_read_content(process, msg_obj)
+
+    try:
+        ts = datetime.datetime.fromtimestamp(create_time).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        ts = str(create_time)
+
+    _g_msg_count += 1
+    print("─" * 60)
+    print("[wx_msg #{}] {}".format(_g_msg_count, ts))
+    print("  obj      : 0x{:016x}".format(msg_obj))
+    print("  svrid    : 0x{:016x}".format(msg_svr))
+    print("  localid  : 0x{:08x}".format(msg_local or 0))
+    print("  flag     : 0x{:x} / 0x{:x}".format(flag1 or 0, flag2 or 0))
+    print("  subtype  : 0x{:x}".format(subtype_vtbl or 0))  # +0x10 处的 vtable，用于区分消息类型
+    print("  from     : {}".format(from_user))
+    if content:
+        print("  content@{}: {}".format(content_off, content[:200]))
+    else:
+        print("  content  : <empty>")
+
+
+
+    # 写缓存前排除误读
+    if content and msg_svr != 0:
+        stripped = _strip_sender_prefix(content)
+        if stripped and _is_valid_content(stripped, from_user):
+            _cache_append(msg_svr, from_user, content)
+
+    if _g_debug_dump:
+        _dump_msg_object(process, msg_obj)
+        # must be in breakpoint context or object freed
+        _deep_scan(process, msg_obj)
+
+    return False
+
+
+def _dump_msg_object(process, addr, obj_size=0x100):
+    raw = _read_mem(process, addr, obj_size)
+    if raw is None:
+        print("    [dump] 读取失败")
+        return
+    print("    [dump] obj @ 0x{:x} ({} bytes):".format(addr, obj_size))
+    for off in range(0, obj_size, 16):
+        line = raw[off:off + 16]
+        hex_part = " ".join("{:02x}".format(b) for b in line)
+        ascii_part = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in line)
+        print("      +0x{:03x}: {}  {}".format(off, hex_part, ascii_part))
+
+    print("    [deref] 候选指针字段:")
+    for off in range(0, obj_size, 8):
+        if off + 8 > len(raw):
+            break
+        ptr = struct.unpack("<Q", raw[off:off + 8])[0]
+        if ptr < 0x100000000 or ptr > 0x10000000000:
+            continue
+        sub = _read_mem(process, ptr, 64)
+        if sub is None:
+            continue
+        printable = sum(1 for b in sub[:32] if 0x20 <= b < 0x7F)
+        if printable < 4:
+            continue
+        ascii_part = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in sub[:48])
+        print("      +0x{:03x} -> 0x{:x}: {}".format(off, ptr, ascii_part))
+
+
+def scan_pattern(process, start_addr, size, max_size=512 * 1024 * 1024):
+    if size > max_size:
+        size = max_size
+
+    chunk_size = 4 * 1024 * 1024  # 4MB
+    overlap = len(PATTERN_PREFIX) + PATTERN_GAP + len(PATTERN_SUFFIX)
+
+    pos = 0
+    chunks_read = 0
+    chunks_failed = 0
+    prefix_hits = 0  # PREFIX 匹配但 SUFFIX 不匹配的次数
+    bytes_scanned = 0
+
+    while pos < size:
+        read_size = min(chunk_size + overlap, size - pos)
+        data = _read_mem(process, start_addr + pos, read_size)
+        if data is None:
+            chunks_failed += 1
+            pos += chunk_size
+            continue
+
+        chunks_read += 1
+        bytes_scanned += len(data)
+
+        idx = 0
+        while True:
+            i = data.find(PATTERN_PREFIX, idx)
+            if i < 0:
+                break
+            prefix_hits += 1
+            suffix_pos = i + len(PATTERN_PREFIX) + PATTERN_GAP
+            if suffix_pos + len(PATTERN_SUFFIX) <= len(data):
+                if data[suffix_pos:suffix_pos + len(PATTERN_SUFFIX)] == PATTERN_SUFFIX:
+                    print("    扫描完成: chunks ok={} fail={} bytes={} prefix_hits={}".format(
+                        chunks_read, chunks_failed, bytes_scanned, prefix_hits))
+                    return start_addr + pos + i
+            idx = i + 1
+
+        pos += chunk_size
+
+    print("    扫描完成（未找到）: chunks ok={} fail={} bytes={} prefix_hits={}".format(
+        chunks_read, chunks_failed, bytes_scanned, prefix_hits))
+    return 0
+
+
+def find_wechat_dylib_text(target):
+    # NOTE: 微信 4.1.x 有两个 wechat.dylib (Resources/ 核心 vs Frameworks/ stub)
+    # 必须用完整路径区分
+    candidates = []
+    for module in target.module_iter():
+        spec = module.GetFileSpec()
+        filename = spec.GetFilename() or ""
+        if filename != "wechat.dylib":
+            continue
+        directory = spec.GetDirectory() or ""
+        full_path = directory + "/" + filename
+        for sec in module.section_iter():
+            if sec.GetName() == "__TEXT":
+                load_addr = sec.GetLoadAddress(target)
+                size = sec.GetByteSize()
+                candidates.append((full_path, load_addr, size))
+                break
+
+    if not candidates:
+        return (0, 0)
+
+    for path, addr, size in candidates:
+        if "/Resources/" in path:
+            print("    [match] {} __TEXT @ 0x{:x} size=0x{:x}".format(path, addr, size))
+            return (addr, size)
+
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    path, addr, size = candidates[0]
+    print("    [fallback] {} __TEXT @ 0x{:x} size=0x{:x}".format(path, addr, size))
+    return (addr, size)
+
+
+def cmd_start(debugger, command, result, internal_dict):
+    target = debugger.GetSelectedTarget()
+    if not target:
+        result.SetError("没有 target，先 attach 微信进程")
+        return
+    process = target.GetProcess()
+    if not process or not process.IsValid():
+        result.SetError("没有 process")
+        return
+
+    print(">>> 扫描 wechat.dylib __TEXT 特征码 ...")
+    text_addr, text_size = find_wechat_dylib_text(target)
+    if text_addr == 0:
+        print("    候选模块：")
+        for module in target.module_iter():
+            spec = module.GetFileSpec()
+            fn = spec.GetFilename() or ""
+            if "wechat" in fn.lower():
+                print("      - {}/{}".format(spec.GetDirectory() or "", fn))
+        result.SetError("未找到 wechat.dylib __TEXT 段（确认 wechat.dylib 已加载）")
+        return
+    if text_size < 1024 * 1024:
+        print("    [WARN] __TEXT size=0x{:x} 异常偏小，可能匹配到 stub".format(text_size))
+
+    func_addr = scan_pattern(process, text_addr, text_size)
+    if func_addr == 0:
+        result.SetError("特征码未匹配（可能版本不一致，需更新 PATTERN）")
+        return
+    # 断点在 +20: +12 mov x19,x1 已执行(obj ready), +16 bl已完成(content ready)
+    # 不能更早，否则 x19 或 content 还没就绪
+    BP_OFFSET_FROM_FUNC_HEAD = 20
+    bp_addr = func_addr + BP_OFFSET_FROM_FUNC_HEAD
+
+    print("    msg func @ 0x{:x}（断点 @ 0x{:x} = +{}）".format(
+        func_addr, bp_addr, BP_OFFSET_FROM_FUNC_HEAD))
+
+    bp = target.BreakpointCreateByAddress(bp_addr)
+    if not bp.IsValid():
+        result.SetError("断点创建失败")
+        return
+    bp.SetScriptCallbackFunction("wechat_msg_monitor.on_msg_hit")
+    bp.SetAutoContinue(True)
+    print(">>> 断点 #{} 已设置 @ 0x{:x}（自动 continue）".format(bp.GetID(), bp_addr))
+    print(">>> 输入 'continue' 让微信跑起来；收到的消息会打印在这里")
+    print(">>> 停止监听：bp delete {}".format(bp.GetID()))
+
+
+def cmd_stop(debugger, command, result, internal_dict):
+    target = debugger.GetSelectedTarget()
+    if not target:
+        return
+    print("请手动 'breakpoint delete <id>' 删除断点")
+
+
+def cmd_stats(debugger, command, result, internal_dict):
+    print("已捕获消息数: {}".format(_g_msg_count))
+    print("去重表大小  : {}".format(len(_g_seen_svrid)))
+    print("调试 dump 模式: {}".format("ON" if _g_debug_dump else "OFF"))
+
+
+def cmd_debug_on(debugger, command, result, internal_dict):
+    global _g_debug_dump
+    _g_debug_dump = True
+    print("[debug] dump 模式已打开。下次命中会输出原始字节。")
+
+
+def cmd_debug_off(debugger, command, result, internal_dict):
+    global _g_debug_dump
+    _g_debug_dump = False
+    print("[debug] dump 模式已关闭。")
+
+
+def _deep_scan(process, addr, scan_size=0x200):
+    print("    [deep_scan] @ 0x{:x}".format(addr))
+    raw = _read_mem(process, addr, scan_size)
+    if raw is None:
+        print("    [deep_scan] 读取失败")
+        return
+
+    found = 0
+    seen_ptrs = set()
+    seen_ptrs.add(addr)
+    for off in range(0, len(raw), 8):
+        if off + 8 > len(raw):
+            break
+        ptr = struct.unpack("<Q", raw[off:off + 8])[0]
+        if ptr < 0x100000000 or ptr > 0x10000000000:
+            continue
+        if ptr in seen_ptrs:
+            continue
+        seen_ptrs.add(ptr)
+
+        sub = _read_mem(process, ptr, 96)
+        if sub is None:
+            continue
+
+        for start in range(0, min(64, len(sub))):
+            ok = 0
+            for i in range(start, min(start + 8, len(sub))):
+                b = sub[i]
+                if 0x20 <= b < 0x7F:
+                    ok += 1
+                else:
+                    break
+            if ok >= 4:  # 放宽到 4 个连续字符
+                end = start
+                for i in range(start, min(start + 80, len(sub))):
+                    if sub[i] == 0:
+                        break
+                    end = i + 1
+                txt = sub[start:end]
+                try:
+                    s = txt.decode("utf-8", errors="replace")
+                    print("      L1 +0x{:03x} -> 0x{:x} +0x{:02x}: {}".format(off, ptr, start, s))
+                    found += 1
+                except Exception:
+                    pass
+                break
+
+        for sub_off in range(0, len(sub), 8):
+            if sub_off + 8 > len(sub):
+                break
+            sub_ptr = struct.unpack("<Q", sub[sub_off:sub_off + 8])[0]
+            if sub_ptr < 0x100000000 or sub_ptr > 0x10000000000:
+                continue
+            if sub_ptr in seen_ptrs:
+                continue
+            seen_ptrs.add(sub_ptr)
+            sub2 = _read_mem(process, sub_ptr, 96)
+            if sub2 is None:
+                continue
+            ok = 0
+            for i in range(min(8, len(sub2))):
+                if 0x20 <= sub2[i] < 0x7F:
+                    ok += 1
+                else:
+                    break
+            if ok >= 4:
+                end = 0
+                for i in range(min(80, len(sub2))):
+                    if sub2[i] == 0:
+                        break
+                    end = i + 1
+                txt = sub2[:end]
+                try:
+                    s = txt.decode("utf-8", errors="replace")
+                    print("      L2 +0x{:03x}/+0x{:02x} -> 0x{:x}: {}".format(off, sub_off, sub_ptr, s))
+                    found += 1
+                except Exception:
+                    pass
+
+    if found == 0:
+        print("    [deep_scan] 未发现可读字符串")
+    else:
+        print("    [deep_scan] 共 {} 处".format(found))
+
+
+def cmd_scan_strings(debugger, command, result, internal_dict):
+    # must be in breakpoint context or object freed
+    args = command.strip().split()
+    if not args:
+        print("用法: wx_scan_strings <addr>")
+        return
+    try:
+        addr = int(args[0], 16) if args[0].startswith("0x") else int(args[0])
+    except ValueError:
+        print("地址格式错误")
+        return
+
+    target = debugger.GetSelectedTarget()
+    process = target.GetProcess()
+    if not process or not process.IsValid():
+        print("没有 process")
+        return
+
+    _deep_scan(process, addr)
+
+
+def __lldb_init_module(debugger, internal_dict):
+    debugger.HandleCommand(
+        'command script add -f wechat_msg_monitor.cmd_start wx_monitor_start'
+    )
+    debugger.HandleCommand(
+        'command script add -f wechat_msg_monitor.cmd_stop wx_monitor_stop'
+    )
+    debugger.HandleCommand(
+        'command script add -f wechat_msg_monitor.cmd_stats wx_monitor_stats'
+    )
+    debugger.HandleCommand(
+        'command script add -f wechat_msg_monitor.cmd_debug_on wx_monitor_debug_on'
+    )
+    debugger.HandleCommand(
+        'command script add -f wechat_msg_monitor.cmd_debug_off wx_monitor_debug_off'
+    )
+    debugger.HandleCommand(
+        'command script add -f wechat_msg_monitor.cmd_scan_strings wx_scan_strings'
+    )
+    print("[wechat_msg_monitor] 已加载。命令：")
+    print("  wx_monitor_start      — 扫描特征码、下断点、开始监听")
+    print("  wx_monitor_stop       — 停止监听")
+    print("  wx_monitor_stats      — 查看统计")
+    print("  wx_monitor_debug_on   — 打开 dump 调试模式")
+    print("  wx_monitor_debug_off  — 关闭 dump 调试模式")
+    print("  wx_scan_strings <addr> — 深度扫描对象里的字符串（需先 process interrupt）")
+
+MONITOR_PY
+
 }
 
-do_close_notify() {
-    mkdir -p "$CONFIG_DIR"
-    if grep -q "^notify=" "$CONFIG_FILE" 2>/dev/null; then
-        sed -i '' 's/^notify=.*/notify=0/' "$CONFIG_FILE"
-    else
-        echo "notify=0" >> "$CONFIG_FILE"
+
+
+
+do_monitor_foreground() {
+    WECHAT_PID=$(pgrep -x WeChat | head -1 || true)
+    if [ -z "$WECHAT_PID" ]; then
+        echo "[ERROR] 微信未运行"; exit 1
     fi
-    echo "[INFO] 撤回通知已关闭"
+    deploy_monitor_files
+    INIT_FILE=$(mktemp /tmp/wx_monitor_init.XXXXXX)
+    cat > "$INIT_FILE" << EOF
+command script import "$MONITOR_INSTALL_DIR/wechat_msg_monitor.py"
+process attach --pid $WECHAT_PID
+wx_monitor_start
+continue
+EOF
+    trap "rm -f $INIT_FILE" EXIT
+    echo "[INFO] attach 微信 (pid=$WECHAT_PID)，Ctrl+C 退出"
+    lldb -s "$INIT_FILE"
 }
 
 # ======================== 入口 ========================
 case "${1:-}" in
-    openNotify)
-        do_open_notify
-        ;;
-    closeNotify)
-        do_close_notify
-        ;;
     --debug|-d)
         do_debug
         ;;
     --uninstall|-u)
         do_uninstall
         ;;
+    --monitor)
+        do_monitor_foreground
+        ;;
     --help|-h)
         print_banner
         echo "用法:"
-        echo "  $0              安装防撤回"
-        echo "  $0 openNotify   开启撤回通知"
-        echo "  $0 closeNotify  关闭撤回通知"
-        echo "  $0 --debug      调试模式（无 hook，允许 lldb）"
-        echo "  $0 --uninstall  卸载"
-        echo "  $0 --help       帮助"
+        echo "  $0                    安装防撤回"
+        echo "  $0 --monitor          前台运行消息监听（调试用）"
+        echo "  $0 --debug            调试模式（无 hook，允许 lldb）"
+        echo "  $0 --uninstall        卸载防撤回"
+        echo "  $0 --help             帮助"
         ;;
     "")
         do_install
         ;;
     *)
         echo "[ERROR] 未知参数: $1"
-        echo "用法: $0 [openNotify|closeNotify|--uninstall|--debug|--help]"
+        echo "用法: $0 [--help]"
         exit 1
         ;;
 esac
