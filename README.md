@@ -48,15 +48,17 @@ chmod +x patch.sh         # 添加可执行权限
 
 ### 可选：启用"撤回通知带原文"
 
-完成基础安装后，在终端前台运行消息监听，撤回通知就会带上原文。
+完成基础安装后，安装消息监听服务，撤回通知就会带上原文（当前只支持私聊，群聊暂不支持）。
 
 ```bash
-./patch.sh --monitor    # 前台运行消息监听，Ctrl+C 退出
+./patch.sh --monitor-install    # 安装（后台自动运行，开机自启）
+./patch.sh --monitor-status     # 查看状态
+./patch.sh --monitor-uninstall  # 卸载
 ```
 
-监听运行期间，收到的消息会被缓存；对方撤回时通知自动展示消息原文。
+安装后无需手动操作。微信启动时自动开始监听消息、微信关闭后自动收尾、下次启动再次跟随。
 
-不运行此命令也不影响防撤回主功能，撤回通知降级为不带原文。
+不安装也不影响防撤回主功能，撤回通知降级为不带原文。
 
 > **已知限制**：部分群聊消息因内部对象结构差异，可能无法缓存原文，撤回时会降级为不带原文的通知。私聊消息和大部分群聊消息可正常获取原文。
 
@@ -67,8 +69,9 @@ chmod +x patch.sh         # 添加可执行权限
 
 ```bash
 ./patch.sh --debug             # 不装 hook，仅签名允许 lldb attach
-./patch.sh --monitor           # 前台运行消息监听
+./patch.sh --monitor           # 前台运行消息监听（调试用，Ctrl+C 退出）
 cat /tmp/antirevoke_debug.log  # 防撤回日志
+cat /tmp/wechat_monitor_daemon.log  # 监听 daemon 日志
 cat /tmp/wechat_msg_cache.tsv  # 消息缓存
 ```
 
@@ -103,9 +106,9 @@ cat /tmp/wechat_msg_cache.tsv  # 消息缓存
 
 - **聊天框内无撤回提示**：由于微信 4.x 的架构限制（C++ 实现 + 符号 strip + 数据库加密），无法在聊天界面内插入系统消息。替代方案为 macOS 系统通知。
 
-- **撤回通知原文需 monitor 在跑**：消息原文功能依赖前台 `./patch.sh --monitor` 监听消息。不运行时撤回通知降级为不带原文。
+- **撤回通知原文需 monitor 服务运行**：通过 `./patch.sh --monitor-install` 安装后自动后台运行。未安装时撤回通知降级为不带原文。
 
-- **monitor 运行时微信会被 lldb attach**：性能影响极小（每条消息触发约 1ms 断点回调）。如果不需要原文功能，不启动 monitor 即可。
+- **monitor 运行时微信会被 lldb attach**：性能影响极小（每条消息触发约 1ms 断点回调）。如果不需要原文功能，不安装 monitor 即可。
 
 ## 风险说明
 

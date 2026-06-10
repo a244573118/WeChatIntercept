@@ -1065,9 +1065,9 @@ do_uninstall() {
 
 # ======================== 消息监听（撤回原文）========================
 
-# 释放内嵌脚本到 MONITOR_INSTALL_DIR
+MONITOR_INSTALL_DIR="$HOME/.local/share/wechatintercept"
+
 deploy_monitor_files() {
-    MONITOR_INSTALL_DIR="/tmp/wechatintercept_monitor"
     mkdir -p "$MONITOR_INSTALL_DIR"
 
     # wechat_msg_monitor.py
@@ -1690,6 +1690,111 @@ EOF
     lldb -s "$INIT_FILE"
 }
 
+# ── 后台 daemon ──────────────────────────────────────────
+MONITOR_LABEL="com.wechatintercept.monitor"
+MONITOR_PLIST="$HOME/Library/LaunchAgents/${MONITOR_LABEL}.plist"
+MONITOR_DAEMON="$MONITOR_INSTALL_DIR/monitor_daemon.sh"
+MONITOR_LOG="/tmp/wechat_monitor_daemon.log"
+MONITOR_PID="/tmp/wechat_monitor_daemon.pid"
+
+deploy_daemon() {
+    deploy_monitor_files
+    cat > "$MONITOR_DAEMON" << 'DAEMON_SH'
+#!/bin/bash
+set -u
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PY_SCRIPT="$SCRIPT_DIR/wechat_msg_monitor.py"
+LOG="/tmp/wechat_monitor_daemon.log"
+PID_FILE="/tmp/wechat_monitor_daemon.pid"
+log() { echo "[$(date '+%H:%M:%S')] $*" >> "$LOG"; }
+cleanup() { [ -n "${LLDB_PID:-}" ] && kill "$LLDB_PID" 2>/dev/null; rm -f "$PID_FILE"; exit 0; }
+trap cleanup INT TERM EXIT
+[ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null && exit 0
+echo $$ > "$PID_FILE"
+log "daemon start pid=$$"
+LLDB_PID="" ; LAST_PID=""
+while true; do
+    WPID=$(pgrep -x WeChat | head -1 || true)
+    if [ -z "$WPID" ]; then
+        [ -n "$LLDB_PID" ] && kill "$LLDB_PID" 2>/dev/null && wait "$LLDB_PID" 2>/dev/null
+        LLDB_PID="" ; LAST_PID=""
+        sleep 3; continue
+    fi
+    if [ "$WPID" != "$LAST_PID" ] || [ -z "$LLDB_PID" ] || ! kill -0 "$LLDB_PID" 2>/dev/null; then
+        [ -n "$LLDB_PID" ] && kill "$LLDB_PID" 2>/dev/null && wait "$LLDB_PID" 2>/dev/null
+        log "attach wechat pid=$WPID"
+        INIT=$(mktemp /tmp/wx_mon.XXXXXX)
+        cat > "$INIT" << LLDBEOF
+command script import "$PY_SCRIPT"
+process attach --pid $WPID
+wx_monitor_start
+continue
+LLDBEOF
+        lldb -b -s "$INIT" >> "$LOG" 2>&1 &
+        LLDB_PID=$!
+        LAST_PID="$WPID"
+        sleep 5
+        rm -f "$INIT"
+    fi
+    sleep 5
+done
+DAEMON_SH
+    chmod +x "$MONITOR_DAEMON"
+}
+
+do_monitor_install() {
+    deploy_daemon
+    mkdir -p "$HOME/Library/LaunchAgents"
+    cat > "$MONITOR_PLIST" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${MONITOR_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${MONITOR_DAEMON}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${MONITOR_LOG}</string>
+    <key>StandardErrorPath</key>
+    <string>${MONITOR_LOG}</string>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>
+EOF
+    launchctl unload "$MONITOR_PLIST" 2>/dev/null || true
+    launchctl load "$MONITOR_PLIST"
+    echo "[OK] 消息监听已安装（后台自动运行）"
+    echo "     日志：tail -f $MONITOR_LOG"
+    echo "     状态：$0 --monitor-status"
+    echo "     卸载：$0 --monitor-uninstall"
+}
+
+do_monitor_uninstall() {
+    [ -f "$MONITOR_PLIST" ] && launchctl unload "$MONITOR_PLIST" 2>/dev/null && rm -f "$MONITOR_PLIST"
+    [ -f "$MONITOR_PID" ] && kill "$(cat "$MONITOR_PID" 2>/dev/null)" 2>/dev/null; rm -f "$MONITOR_PID"
+    [ -d "$MONITOR_INSTALL_DIR" ] && rm -rf "$MONITOR_INSTALL_DIR"
+    echo "[OK] 消息监听已卸载"
+}
+
+do_monitor_status() {
+    [ -f "$MONITOR_PLIST" ] && echo "LaunchAgent: 已安装" || echo "LaunchAgent: 未安装"
+    if [ -f "$MONITOR_PID" ] && kill -0 "$(cat "$MONITOR_PID" 2>/dev/null)" 2>/dev/null; then
+        echo "daemon: 运行中 (pid=$(cat "$MONITOR_PID"))"
+    else echo "daemon: 未运行"; fi
+    WPID=$(pgrep -x WeChat | head -1 || true)
+    [ -n "$WPID" ] && echo "微信: 运行中 (pid=$WPID)" || echo "微信: 未运行"
+    [ -f /tmp/wechat_msg_cache.tsv ] && echo "缓存: $(wc -l < /tmp/wechat_msg_cache.tsv) 行" || echo "缓存: 空"
+    [ -f "$MONITOR_LOG" ] && echo "" && echo "── 最近日志 ──" && tail -5 "$MONITOR_LOG"
+}
+
 # ======================== 入口 ========================
 case "${1:-}" in
     --debug|-d)
@@ -1701,14 +1806,26 @@ case "${1:-}" in
     --monitor)
         do_monitor_foreground
         ;;
+    --monitor-install)
+        do_monitor_install
+        ;;
+    --monitor-uninstall)
+        do_monitor_uninstall
+        ;;
+    --monitor-status)
+        do_monitor_status
+        ;;
     --help|-h)
         print_banner
         echo "用法:"
-        echo "  $0                    安装防撤回"
-        echo "  $0 --monitor          前台运行消息监听（调试用）"
-        echo "  $0 --debug            调试模式（无 hook，允许 lldb）"
-        echo "  $0 --uninstall        卸载防撤回"
-        echo "  $0 --help             帮助"
+        echo "  $0                     安装防撤回"
+        echo "  $0 --monitor-install   安装消息监听（后台自动运行）"
+        echo "  $0 --monitor-uninstall 卸载消息监听"
+        echo "  $0 --monitor-status    查看监听状态"
+        echo "  $0 --monitor           前台运行消息监听（调试用）"
+        echo "  $0 --debug             调试模式（无 hook，允许 lldb）"
+        echo "  $0 --uninstall         卸载防撤回"
+        echo "  $0 --help              帮助"
         ;;
     "")
         do_install
