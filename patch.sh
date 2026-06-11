@@ -223,7 +223,27 @@ _Bool hook_isRevokeMessage(void *msg) {
 
     load_my_user_id();
 
-    const char *sender = (const char *)((uint8_t *)msg + 0x18);
+    // 动态寻址 sender 字符串：+0x18 在新 build 中可能是标记字节
+    // 从 +0x18 开始搜第一个可打印 C 字符串
+    int sender_off = 0x18;
+    {
+        int found = 0;
+        for (int off = 0x18; off <= 0x20; off++) {
+            const unsigned char *p = (const unsigned char *)msg + off;
+            if (p[0] >= 0x20 && p[0] <= 0x7E &&
+                p[1] >= 0x20 && p[1] <= 0x7E &&
+                p[2] >= 0x20 && p[2] <= 0x7E) {
+                sender_off = off;
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            // 极端 fallback 仍然用 +0x18
+            sender_off = 0x18;
+        }
+    }
+    const char *sender = (const char *)((uint8_t *)msg + sender_off);
 
     if (!is_valid_sender(sender)) {
         ARLOG("WARN: sender 区域非可打印 ASCII，跳过此次调用");
