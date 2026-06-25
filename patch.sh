@@ -94,6 +94,7 @@ compile_dylib() {
     rm -f "$SRC_FILE"
     cat > "$SRC_FILE" << 'HOOK_SOURCE'
 #import <Foundation/Foundation.h>
+#import <UserNotifications/UserNotifications.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach/mach.h>
@@ -130,6 +131,55 @@ static const uintptr_t k419_FuncVA_x86_64  = 0x4AF08D0;
 // 当前登录用户 wxid，用于区分"自己撤回"vs"对方撤回"
 static char g_my_id[64] = {0};
 static _Bool g_my_id_loaded = 0;
+
+static _Bool looks_like_internal_id(const char *s) {
+    if (!s || s[0] == '\0') return 1;
+    while (*s == ' ' || *s == '\t' || *s == '"' || *s == '\'' || *s == '&') s++;
+    if (strncmp(s, "wxid_", 5) == 0) return 1;
+    if (strncmp(s, "gh_", 3) == 0) return 1;
+    size_t len = strlen(s);
+    if (len >= 9 && strcmp(s + len - 9, "@chatroom") == 0) return 1;
+    return 0;
+}
+
+static void copy_clean_name(char *dst, size_t dst_size, const char *src) {
+    if (!dst || dst_size == 0) return;
+    dst[0] = '\0';
+    if (!src) return;
+
+    while (*src == ' ' || *src == '\t' || *src == '"' || *src == '\'' || *src == '&') src++;
+    size_t len = strlen(src);
+    while (len > 0) {
+        unsigned char c = (unsigned char)src[len - 1];
+        if (c == ' ' || c == '\t' || c == '"' || c == '\'' || c == '\r' || c == '\n') {
+            len--;
+            continue;
+        }
+        break;
+    }
+    if (len == 0) return;
+    if (len >= dst_size) len = dst_size - 1;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+
+static const char *pick_display_name(char *buffer, size_t buffer_size,
+                                     const char *primary, const char *secondary, const char *fallback) {
+    if (primary && primary[0] != '\0' && !looks_like_internal_id(primary)) {
+        copy_clean_name(buffer, buffer_size, primary);
+        if (buffer[0] != '\0') return buffer;
+    }
+    if (secondary && secondary[0] != '\0' && !looks_like_internal_id(secondary)) {
+        copy_clean_name(buffer, buffer_size, secondary);
+        if (buffer[0] != '\0') return buffer;
+    }
+    if (fallback && fallback[0] != '\0' && !looks_like_internal_id(fallback)) {
+        copy_clean_name(buffer, buffer_size, fallback);
+        if (buffer[0] != '\0') return buffer;
+    }
+    copy_clean_name(buffer, buffer_size, "对方");
+    return buffer;
+}
 
 // 通过取 ~/Library/Containers/.../app_data/login/ 下最新修改的目录名判定
 static void load_my_user_id(void) {
@@ -179,26 +229,61 @@ static void load_my_user_id(void) {
 
 
 
-static void send_notification(const char *text) {
-    // osascript 对 " 和 \ 敏感，必须转义
-    char *escaped = (char *)malloc(1024);
-    if (!escaped) return;
-    int j = 0;
-    for (int i = 0; text[i] && j < 1022; i++) {
-        if (text[i] == '"' || text[i] == '\\') escaped[j++] = '\\';
-        escaped[j++] = text[i];
-    }
-    escaped[j] = '\0';
+static void send_notification_with_title(const char *title_text, const char *body_text) {
+    if (!body_text || body_text[0] == '\0') return;
 
-    dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        FILE *sf = fopen("/tmp/antirevoke_notify.scpt", "w");
-        if (sf) {
-            fprintf(sf, "display notification \"%s\" with title \"WeChatIntercept\"\n", escaped);
-            fclose(sf);
-            system("osascript /tmp/antirevoke_notify.scpt");
+    char *title_copy = strdup(title_text && title_text[0] != '\0' ? title_text : "WeChatIntercept");
+    char *body_copy = strdup(body_text);
+    if (!title_copy || !body_copy) {
+        free(title_copy);
+        free(body_copy);
+        return;
+    }
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            NSString *title = [NSString stringWithUTF8String:title_copy];
+            NSString *body = [NSString stringWithUTF8String:body_copy];
+            if (!body || [body length] == 0) {
+                free(title_copy);
+                free(body_copy);
+                return;
+            }
+
+            UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+            [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert |
+                                                     UNAuthorizationOptionBadge |
+                                                     UNAuthorizationOptionSound)
+                                  completionHandler:^(BOOL granted, NSError *error) {
+                if (!granted) {
+                    ARLOG("通知权限未授予");
+                }
+                if (error) {
+                    ARLOG("通知授权失败: %s", [[error localizedDescription] UTF8String]);
+                }
+            }];
+
+            UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+            content.title = title ?: @"WeChatIntercept";
+            content.body = body;
+
+            UNNotificationRequest *request =
+                [UNNotificationRequest requestWithIdentifier:[[NSUUID UUID] UUIDString]
+                                                     content:content
+                                                     trigger:nil];
+            [center addNotificationRequest:request withCompletionHandler:^(NSError *error) {
+                if (error) {
+                    ARLOG("通知投递失败: %s", [[error localizedDescription] UTF8String]);
+                }
+            }];
         }
-        free(escaped);
+        free(title_copy);
+        free(body_copy);
     });
+}
+
+static void send_notification(const char *text) {
+    send_notification_with_title("WeChatIntercept", text);
 }
 
 // 微信小版本升级 sender 偏移可能漂移；仅检查前 4 字节是否可打印 ASCII
@@ -252,16 +337,8 @@ _Bool hook_isRevokeMessage(void *msg) {
         g_invalid_count++;
         if (g_invalid_count >= 5 && !g_warned) {
             g_warned = 1;
-            char *cmd = (char *)malloc(1024);
-            if (cmd) {
-                snprintf(cmd, 1024,
-                    "osascript -e 'display notification \"sender 偏移已失效，快去催 WeChatIntercept 作者更新适配\" "
-                    "with title \"WeChatIntercept 需更新\"' &");
-                dispatch_async(dispatch_get_global_queue(0, 0), ^{
-                    system(cmd);
-                    free(cmd);
-                });
-            }
+            send_notification_with_title("WeChatIntercept 需更新",
+                                         "sender 偏移已失效，快去催 WeChatIntercept 作者更新适配");
         }
         return 1;
     }
@@ -276,7 +353,6 @@ _Bool hook_isRevokeMessage(void *msg) {
     // 从 msg+0x130 (ptr) / +0x138 (len) 读撤回 XML
     char notify_text[256] = {0};
 
-#if defined(__arm64__) || defined(__aarch64__)
     uint64_t xml_ptr = *(uint64_t *)((uint8_t *)msg + 0x130);
     uint64_t xml_len = *(uint64_t *)((uint8_t *)msg + 0x138);
     if (xml_ptr > 0x100000000ULL && xml_len > 0 && xml_len < 4096) {
@@ -293,12 +369,11 @@ _Bool hook_isRevokeMessage(void *msg) {
             }
         }
     }
-#endif
 
     // 反查 lldb monitor 写入的消息缓存（/tmp/wechat_msg_cache.tsv）
     char orig_content[512] = {0};
+    char cached_name[128] = {0};
     _Bool has_orig = 0;
-#if defined(__arm64__) || defined(__aarch64__)
     if (xml_ptr > 0x100000000ULL && xml_len > 0 && xml_len < 4096) {
         const char *xml_body = (const char *)xml_ptr;
         const char *p = strstr(xml_body, "<newmsgid>");
@@ -317,19 +392,40 @@ _Bool hook_isRevokeMessage(void *msg) {
             if (cf) {
                 char line[1024];
                 while (fgets(line, sizeof(line), cf)) {
-                    char *t1 = strchr(line, '\t');
-                    if (!t1) continue;
-                    *t1 = '\0';
+                    char *nl = strchr(line, '\n');
+                    if (nl) *nl = '\0';
+
+                    char *fields[4] = {0};
+                    int field_count = 0;
+                    char *cursor = line;
+                    while (field_count < 4 && cursor) {
+                        fields[field_count++] = cursor;
+                        char *tab = strchr(cursor, '\t');
+                        if (!tab) break;
+                        *tab = '\0';
+                        cursor = tab + 1;
+                    }
+                    if (field_count < 3) continue;
+
                     uint64_t row_svrid = 0;
                     int d2 = 0;
-                    for (const char *q = line; *q >= '0' && *q <= '9' && d2 < 20; q++, d2++)
+                    for (const char *q = fields[0]; *q >= '0' && *q <= '9' && d2 < 20; q++, d2++)
                         row_svrid = row_svrid * 10 + (uint64_t)(*q - '0');
                     if (d2 == 0 || row_svrid != newmsgid) continue;
-                    char *t2 = strchr(t1 + 1, '\t');
-                    if (!t2) continue;
-                    char *nl = strchr(t2 + 1, '\n');
-                    if (nl) *nl = '\0';
-                    strncpy(orig_content, t2 + 1, sizeof(orig_content) - 1);
+
+                    const char *row_name = "";
+                    const char *row_content = "";
+                    if (field_count >= 4) {
+                        row_name = fields[2];
+                        row_content = fields[3];
+                    } else {
+                        row_content = fields[2];
+                    }
+
+                    if (row_name[0] != '\0') {
+                        copy_clean_name(cached_name, sizeof(cached_name), row_name);
+                    }
+                    strncpy(orig_content, row_content, sizeof(orig_content) - 1);
                     has_orig = (orig_content[0] != '\0');
                 }
                 fclose(cf);
@@ -338,7 +434,6 @@ _Bool hook_isRevokeMessage(void *msg) {
                   (unsigned long long)newmsgid, has_orig ? "命中" : "未命中");
         }
     }
-#endif
 
     // 非文本消息描述模板 → 占位符
     if (has_orig) {
@@ -372,13 +467,14 @@ _Bool hook_isRevokeMessage(void *msg) {
             if (nlen > 0 && nlen < sizeof(nick)) { memcpy(nick, start, nlen); nick[nlen] = '\0'; }
         }
     }
-    const char *who = (nick[0] != '\0') ? nick : sender;
+    char who_buf[128] = {0};
+    const char *who = pick_display_name(who_buf, sizeof(who_buf), nick, cached_name, sender);
 
     char content[768] = {0};
     if (has_orig) {
-        snprintf(content, sizeof(content), "拦截到「%s」撤回了一条消息：%s", who, orig_content);
+        snprintf(content, sizeof(content), "「%s」撤回了一条消息：%s", who, orig_content);
     } else {
-        snprintf(content, sizeof(content), "拦截到「%s」撤回了一条消息", who);
+        snprintf(content, sizeof(content), "「%s」撤回了一条消息", who);
     }
 
     send_notification(content);
@@ -569,10 +665,6 @@ static _Bool install_x86_64_trampoline(uintptr_t func_addr, uintptr_t hook_addr)
 }
 
 static void notify_install_failed(const char *short_ver, const char *build, _Bool known_build) {
-
-    char *cmd = (char *)malloc(2048);
-    if (!cmd) return;
-
     char title[64];
     char body[512];
 
@@ -588,22 +680,7 @@ static void notify_install_failed(const char *short_ver, const char *build, _Boo
             short_ver, build);
     }
 
-    char escaped[1024];
-    int j = 0;
-    for (int i = 0; body[i] && j < (int)sizeof(escaped) - 2; i++) {
-        if (body[i] == '"' || body[i] == '\\') escaped[j++] = '\\';
-        escaped[j++] = body[i];
-    }
-    escaped[j] = '\0';
-
-    snprintf(cmd, 2048,
-        "osascript -e 'display notification \"%s\" with title \"%s\"' &",
-        escaped, title);
-
-    dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        system(cmd);
-        free(cmd);
-    });
+    send_notification_with_title(title, body);
 }
 
 // ── 主 constructor ───────────────────────────────────────────
@@ -724,7 +801,7 @@ static void hook_init(void) {
 }
 HOOK_SOURCE
 
-    clang -arch arm64 -arch x86_64 -shared -framework Foundation \
+    clang -arch arm64 -arch x86_64 -shared -framework Foundation -framework UserNotifications \
         -o "$DYLIB_DST" \
         -install_name "$DYLIB_INSTALL_NAME" \
         "$SRC_FILE" 2>&1
@@ -1157,14 +1234,38 @@ def _is_valid_content(stripped, from_user):
     return True
 
 
-def _cache_append(svrid, from_user, content):
+def _looks_like_internal_id(value):
+    if not value:
+        return True
+    value = value.strip().lstrip("&").strip("\"'")
+    return (
+        value.startswith("wxid_")
+        or value.startswith("gh_")
+        or value.endswith("@chatroom")
+    )
+
+
+def _extract_display_name(from_user, content):
+    if content:
+        idx = content.find(" : ")
+        if idx > 0 and idx < 64:
+            prefix = content[:idx].strip().strip("\"'")
+            if prefix and not _looks_like_internal_id(prefix):
+                return prefix
+    if from_user and not _looks_like_internal_id(from_user):
+        return from_user.strip().strip("\"'")
+    return ""
+
+
+def _cache_append(svrid, from_user, display_name, content):
     if svrid == 0 or not content:
         return
     try:
         body = _strip_sender_prefix(content)
-        line = "{}\t{}\t{}\n".format(
+        line = "{}\t{}\t{}\t{}\n".format(
             svrid,
             _sanitize_field(from_user)[:63],
+            _sanitize_field(display_name)[:127],
             _sanitize_field(body)[:511],
         )
         _g_cache_lines.append(line)
@@ -1364,7 +1465,8 @@ def on_msg_hit(frame, bp_loc, dict_):
     if content and msg_svr != 0:
         stripped = _strip_sender_prefix(content)
         if stripped and _is_valid_content(stripped, from_user):
-            _cache_append(msg_svr, from_user, content)
+            display_name = _extract_display_name(from_user, content)
+            _cache_append(msg_svr, from_user, display_name, content)
 
     if _g_debug_dump:
         _dump_msg_object(process, msg_obj)
