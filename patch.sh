@@ -121,6 +121,8 @@ static const uintptr_t k419_SlotVA_arm64   = 0x9301838;
 static const uintptr_t k4110_FuncVA_arm64  = 0x44FFE20;
 // 4.1.13 (269602) 实测入口；与特征码搜索结果一致，用于跳过全段扫描
 static const uintptr_t k4113_FuncVA_arm64  = 0x4661F5C;
+// 4.1.15 (270115) 实测入口：特征码唯一命中，前一条为 ret、后 20 字节即下一函数
+static const uintptr_t k4115_FuncVA_arm64  = 0x48CC078;
 static const uintptr_t k4110_FuncVA_x86_64 = 0x4B4E9A0;
 static const uintptr_t k419_FuncVA_x86_64  = 0x4AF08D0;
 
@@ -479,7 +481,7 @@ static uintptr_t scan_isRevokeMessage_x86_64(uintptr_t text_start, size_t text_s
     return 0;
 }
 
-static const char *kKnownBuilds[] = { "268602", "268824", "269602", NULL };
+static const char *kKnownBuilds[] = { "268602", "268824", "269602", "270115", NULL };
 
 static _Bool is_known_build(const char *build) {
     if (!build) return 0;
@@ -633,7 +635,7 @@ static void hook_init(void) {
         uintptr_t func_addr = 0;
         // 依次尝试已知版本的硬编码入口，任一匹配即可跳过全段特征码扫描。
         // 都失配时回落到特征码搜索（小版本升级后的常规路径）。
-        const uintptr_t kFastCandidates[] = { k4113_FuncVA_arm64, k4110_FuncVA_arm64 };
+        const uintptr_t kFastCandidates[] = { k4115_FuncVA_arm64, k4113_FuncVA_arm64, k4110_FuncVA_arm64 };
         for (size_t ci = 0; ci < sizeof(kFastCandidates)/sizeof(kFastCandidates[0]); ci++) {
             uintptr_t cand = slide + kFastCandidates[ci];
             if (*(volatile uint32_t *)cand != 0xB9400C08u) continue;
