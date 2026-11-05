@@ -103,8 +103,17 @@ clang -arch arm64 -arch x86_64 -shared \
 |---|---|---|
 | 阻止撤回、消息保留 | ✅ | |
 | 系统通知提醒 | ✅ | 归属微信，可正常显示 |
-| 显示发送者昵称 | ❌ | 只有 wxid，昵称不在 `CMessageWrap` 内 |
+| 显示发送者昵称 | ❌ | 只有 wxid，昵称不在 `CMessageWrap` 内；已过滤内部 ID 回落为「对方」 |
 | 显示撤回原文 | ❌ | 见下节 |
+
+### 显示名处理
+
+`+0x18` 只有 wxid 这类内部 ID，无法直接展示。实现中通过
+`looks_like_internal_id()` 过滤 `wxid_` / `gh_` / `*@chatroom` 前缀，
+过滤后回落到「对方」，避免通知里出现 `wxid_19tplkccvpa022` 这样的长串。
+
+该函数接受 `primary` / `secondary` / `fallback` 三级候选，为将来接入
+联系人表查询预留了扩展点。
 
 ### 为什么拿不到原文
 

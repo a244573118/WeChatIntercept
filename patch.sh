@@ -88,6 +88,7 @@ compile_dylib() {
     rm -f "$SRC_FILE"
     cat > "$SRC_FILE" << 'HOOK_SOURCE'
 #import <Foundation/Foundation.h>
+#import <UserNotifications/UserNotifications.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach/mach.h>
@@ -124,6 +125,55 @@ static const uintptr_t k419_FuncVA_x86_64  = 0x4AF08D0;
 // 当前登录用户 wxid，用于区分"自己撤回"vs"对方撤回"
 static char g_my_id[64] = {0};
 static _Bool g_my_id_loaded = 0;
+
+static _Bool looks_like_internal_id(const char *s) {
+    if (!s || s[0] == '\0') return 1;
+    while (*s == ' ' || *s == '\t' || *s == '"' || *s == '\'' || *s == '&') s++;
+    if (strncmp(s, "wxid_", 5) == 0) return 1;
+    if (strncmp(s, "gh_", 3) == 0) return 1;
+    size_t len = strlen(s);
+    if (len >= 9 && strcmp(s + len - 9, "@chatroom") == 0) return 1;
+    return 0;
+}
+
+static void copy_clean_name(char *dst, size_t dst_size, const char *src) {
+    if (!dst || dst_size == 0) return;
+    dst[0] = '\0';
+    if (!src) return;
+
+    while (*src == ' ' || *src == '\t' || *src == '"' || *src == '\'' || *src == '&') src++;
+    size_t len = strlen(src);
+    while (len > 0) {
+        unsigned char c = (unsigned char)src[len - 1];
+        if (c == ' ' || c == '\t' || c == '"' || c == '\'' || c == '\r' || c == '\n') {
+            len--;
+            continue;
+        }
+        break;
+    }
+    if (len == 0) return;
+    if (len >= dst_size) len = dst_size - 1;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+
+static const char *pick_display_name(char *buffer, size_t buffer_size,
+                                     const char *primary, const char *secondary, const char *fallback) {
+    if (primary && primary[0] != '\0' && !looks_like_internal_id(primary)) {
+        copy_clean_name(buffer, buffer_size, primary);
+        if (buffer[0] != '\0') return buffer;
+    }
+    if (secondary && secondary[0] != '\0' && !looks_like_internal_id(secondary)) {
+        copy_clean_name(buffer, buffer_size, secondary);
+        if (buffer[0] != '\0') return buffer;
+    }
+    if (fallback && fallback[0] != '\0' && !looks_like_internal_id(fallback)) {
+        copy_clean_name(buffer, buffer_size, fallback);
+        if (buffer[0] != '\0') return buffer;
+    }
+    copy_clean_name(buffer, buffer_size, "对方");
+    return buffer;
+}
 
 // 通过取 ~/Library/Containers/.../app_data/login/ 下最新修改的目录名判定
 static void load_my_user_id(void) {
@@ -173,54 +223,63 @@ static void load_my_user_id(void) {
 
 
 
-static void send_notification(const char *text) {
-    // macOS 15：NSUserNotification 已废弃（请求进管道后被清除）
-    //            osascript 归属 scripteditor2 无授权
-    // 唯一可行：进程内用 UNUserNotificationCenter（需链接 UserNotifications.framework）
-    NSString *body = [NSString stringWithUTF8String:text ? text : ""];
-    if (body.length == 0) return;
+static void send_notification_with_title(const char *title_text, const char *body_text) {
+    if (!body_text || body_text[0] == '\0') return;
+
+    char *title_copy = strdup(title_text && title_text[0] != '\0' ? title_text : "WeChatIntercept");
+    char *body_copy = strdup(body_text);
+    if (!title_copy || !body_copy) {
+        free(title_copy);
+        free(body_copy);
+        return;
+    }
 
     dispatch_async(dispatch_get_main_queue(), ^{
-        @try {
-            Class centerCls  = NSClassFromString(@"UNUserNotificationCenter");
-            Class contentCls = NSClassFromString(@"UNMutableNotificationContent");
-            Class reqCls     = NSClassFromString(@"UNNotificationRequest");
-            if (!centerCls || !contentCls || !reqCls) {
-                ARLOG("通知: 框架类不可用");
+        @autoreleasepool {
+            NSString *title = [NSString stringWithUTF8String:title_copy];
+            NSString *body = [NSString stringWithUTF8String:body_copy];
+            if (!body || [body length] == 0) {
+                free(title_copy);
+                free(body_copy);
                 return;
             }
 
-            id content = [[contentCls alloc] init];
-            [content setValue:@"微信防撤回" forKey:@"title"];
-            [content setValue:body forKey:@"body"];
+            UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+            [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert |
+                                                     UNAuthorizationOptionBadge |
+                                                     UNAuthorizationOptionSound)
+                                  completionHandler:^(BOOL granted, NSError *error) {
+                if (!granted) {
+                    ARLOG("通知权限未授予");
+                }
+                if (error) {
+                    ARLOG("通知授权失败: %s", [[error localizedDescription] UTF8String]);
+                }
+            }];
 
-            id center = [centerCls currentNotificationCenter];
-            if (!center) { ARLOG("通知: center 为空"); return; }
+            UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+            content.title = title ?: @"WeChatIntercept";
+            content.body = body;
 
-            NSString *ident = [NSString stringWithFormat:@"antirevoke-%llu",
-                               (unsigned long long)([[NSDate date] timeIntervalSince1970] * 1000)];
-
-            // 注意：performSelector 最多 2 个 object 参数，三参必须用 IMP 强转函数指针
-            typedef id (*ReqFn)(id, SEL, id, id, id);
-            ReqFn reqFn = (ReqFn)[reqCls methodForSelector:
-                                  NSSelectorFromString(@"requestWithIdentifier:content:trigger:")];
-            if (!reqFn) { ARLOG("通知: 无 requestWithIdentifier"); return; }
-            id req = reqFn(reqCls, NSSelectorFromString(@"requestWithIdentifier:content:trigger:"),
-                           ident, content, nil);
-            if (!req) { ARLOG("通知: request 构造失败"); return; }
-
-            SEL addSel = NSSelectorFromString(@"addNotificationRequest:withCompletionHandler:");
-            typedef void (*AddFn)(id, SEL, id, id);
-            AddFn addFn = (AddFn)[center methodForSelector:addSel];
-            if (!addFn) { ARLOG("通知: 无 addNotificationRequest"); return; }
-            addFn(center, addSel, req, nil);
-
-            ARLOG("通知: 已提交 %s", [ident UTF8String]);
-        } @catch (NSException *e) {
-            ARLOG("通知异常: %s", [[e description] UTF8String]);
+            UNNotificationRequest *request =
+                [UNNotificationRequest requestWithIdentifier:[[NSUUID UUID] UUIDString]
+                                                     content:content
+                                                     trigger:nil];
+            [center addNotificationRequest:request withCompletionHandler:^(NSError *error) {
+                if (error) {
+                    ARLOG("通知投递失败: %s", [[error localizedDescription] UTF8String]);
+                }
+            }];
         }
+        free(title_copy);
+        free(body_copy);
     });
 }
+
+static void send_notification(const char *text) {
+    send_notification_with_title("WeChatIntercept", text);
+}
+
 
 // 微信小版本升级 sender 偏移可能漂移；仅检查前 4 字节是否可打印 ASCII
 // 失效时静默放行（return 1），不影响微信内部撤回流程；阈值后弹一次催更新通知
@@ -299,12 +358,13 @@ _Bool hook_isRevokeMessage(void *msg) {
     // （微信是「确认是撤回」之后才填充该字段），所以在这里读它本就拿不到东西；
     // 而盲目解引用未验证的指针会导致 EXC_BAD_ACCESS（已踩过）。
     // 这里只用一个已确认安全的字段：+0x18 的发送者 wxid。
-    const char *who = sender;
-    if (who[0] == '\0') who = "有人";
+    // pick_display_name：过滤 wxid_/gh_/@chatroom 这类内部 ID，
+    // 都不可用时回落到「对方」，避免通知里出现长串 wxid
+    char who_buf[128] = {0};
+    const char *who = pick_display_name(who_buf, sizeof(who_buf), NULL, NULL, sender);
 
     char content[512] = {0};
-    snprintf(content, sizeof(content),
-             "「%s」撤回了一条消息（原文已保留）", who);
+    snprintf(content, sizeof(content), "「%s」撤回了一条消息", who);
 
     ARLOG("提示: %s", content);
     send_notification(content);
