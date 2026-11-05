@@ -119,6 +119,8 @@ static const int32_t  kRevokeType    = 0x2712;   // isRevokeMessage 比较的 Ms
 // 已知 build 的硬编码地址（特征码搜索失败时的兜底）
 static const uintptr_t k419_SlotVA_arm64   = 0x9301838;
 static const uintptr_t k4110_FuncVA_arm64  = 0x44FFE20;
+// 4.1.13 (269602) 实测入口；与特征码搜索结果一致，用于跳过全段扫描
+static const uintptr_t k4113_FuncVA_arm64  = 0x4661F5C;
 static const uintptr_t k4110_FuncVA_x86_64 = 0x4B4E9A0;
 static const uintptr_t k419_FuncVA_x86_64  = 0x4AF08D0;
 
@@ -629,15 +631,18 @@ static void hook_init(void) {
 #if defined(__arm64__) || defined(__aarch64__)
         // 三级查找：硬编码快速路径 → 特征码搜索 → 4.1.9 slot fallback
         uintptr_t func_addr = 0;
-        uintptr_t func_4110 = slide + k4110_FuncVA_arm64;
-        uint32_t head_insn = *(volatile uint32_t *)func_4110;
-
-        if (head_insn == 0xB9400C08u) {
-            uint32_t *p = (uint32_t *)func_4110;
+        // 依次尝试已知版本的硬编码入口，任一匹配即可跳过全段特征码扫描。
+        // 都失配时回落到特征码搜索（小版本升级后的常规路径）。
+        const uintptr_t kFastCandidates[] = { k4113_FuncVA_arm64, k4110_FuncVA_arm64 };
+        for (size_t ci = 0; ci < sizeof(kFastCandidates)/sizeof(kFastCandidates[0]); ci++) {
+            uintptr_t cand = slide + kFastCandidates[ci];
+            if (*(volatile uint32_t *)cand != 0xB9400C08u) continue;
+            uint32_t *p = (uint32_t *)cand;
             if (p[1] == 0x5284E249u && p[2] == 0x6B09011Fu &&
                 p[3] == 0x1A9F17E0u && p[4] == 0xD65F03C0u) {
-                func_addr = func_4110;
+                func_addr = cand;
                 ARLOG("快速路径命中: 0x%lx", (unsigned long)func_addr);
+                break;
             }
         }
 
@@ -1026,8 +1031,20 @@ do_debug() {
     kill_wechat
     remove_provenance
 
+    # 提权：dylib 和签名都在 /Applications（root:wheel）下，
+    # 不提权的话 rm/codesign 会静默失败（原来没有 sudo 但加了 || true，用户看不出问题）
+    echo "[INFO] 需要管理员权限，请输入密码..."
+    sudo -v || { echo "[ERROR] 无法获取管理员权限"; exit 1; }
+    ( while true; do sudo -n true 2>/dev/null; sleep 50; kill -0 $$ 2>/dev/null || exit; done ) &
+    SUDO_PID=$!
+
     # 删除已有的 hook dylib（确保无 hook）
-    rm -f "$DYLIB_DST" 2>/dev/null || true
+    sudo rm -f "$DYLIB_DST" 2>/dev/null || true
+    if [ -f "$DYLIB_DST" ]; then
+        kill $SUDO_PID 2>/dev/null || true
+        echo "[ERROR] 无法删除已有 dylib，请先运行 ./patch.sh --uninstall"
+        exit 1
+    fi
 
     # 签名（带 get-task-allow，允许 lldb attach）
     echo "[INFO] 重签名（注入调试 entitlements）..."
@@ -1047,10 +1064,22 @@ do_debug() {
 </plist>
 ENTITLEMENTS
 
-    codesign --force --deep --sign - "$WECHAT_APP" 2>/dev/null
-    codesign --force --sign - --entitlements "$ENT_FILE" "$WECHAT_BIN" 2>/dev/null
-    xattr -cr "$WECHAT_APP" 2>/dev/null || true
+    if ! sudo codesign --force --deep --sign - "$WECHAT_APP"; then
+        kill $SUDO_PID 2>/dev/null || true
+        rm -f "$ENT_FILE"
+        echo "[ERROR] 重签名失败"
+        exit 1
+    fi
+    sudo codesign --force --sign - --entitlements "$ENT_FILE" "$WECHAT_BIN"
+    sudo xattr -cr "$WECHAT_APP" 2>/dev/null || true
     rm -f "$ENT_FILE"
+    kill $SUDO_PID 2>/dev/null || true
+
+    # 校验 entitlements 真的写进去了
+    if ! codesign -d --entitlements - "$WECHAT_BIN" 2>&1 | grep -q "get-task-allow"; then
+        echo "[ERROR] get-task-allow 未生效，lldb 无法 attach"
+        exit 1
+    fi
 
     echo "[INFO] 启动微信..."
     open "$WECHAT_APP"
