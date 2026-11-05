@@ -29,18 +29,33 @@ macOS 微信防撤回工具，支持微信 4.1.x 系列，欢迎共建和 star�
 ## 快速开始
 
 ```bash
-# 1. 安装防撤回（必须）
+# 推荐：一键安装（自动备份原版主程序 + 安装防撤回）
+chmod +x install-4x.sh
+./install-4x.sh
+```
+
+`install-4x.sh` 会先按当前微信版本备份原版主程序到 `~/wechat_backup_<版本号>`，
+再调用 `patch.sh` 完成安装。**备份很重要**——微信升级会替换整个 App，
+升级后旧版本的备份无法用于新版本回滚。
+
+如果只想直接安装（自己已备份）：
+
+```bash
 chmod +x patch.sh
 ./patch.sh
-
-# 2. 安装消息监听（可选，用于撤回通知带原文）
-#    注意：微信 4.1.13 上暂不生效，详见 ADAPT-4.1.13.md
-./patch.sh --monitor-install
 ```
 
 完成后手动打开微信（脚本不会自动重启），之后对方撤回消息时你会收到系统通知。
 
 > 安装过程会请求一次管理员密码，用于写入 `/Applications` 并重签名。
+
+### 可选：安装消息监听
+
+```bash
+./patch.sh --monitor-install
+```
+
+用于通知中显示撤回原文。**微信 4.1.13 及以上暂不生效**，详见 [ADAPT-4.1.13.md](ADAPT-4.1.13.md)。
 
 ---
 
@@ -48,7 +63,9 @@ chmod +x patch.sh
 
 | 命令                             | 作用                                   |
 | -------------------------------- | -------------------------------------- |
-| `./patch.sh`                     | 安装防撤回                             |
+| `./install-4x.sh`                   | **推荐**：一键安装（自动备份 + 安装）   |
+| `./install-4x.sh --no-backup`       | 安装但跳过备份                         |
+| `./patch.sh`                     | 安装防撤回（不备份）                   |
 | `./patch.sh --monitor-install`   | 安装消息监听（后台自动运行，开机自启） |
 | `./patch.sh --monitor-status`    | 查看监听状态                           |
 | `./patch.sh --monitor-uninstall` | 卸载消息监听                           |
@@ -111,8 +128,11 @@ cat /tmp/wechat_monitor_daemon.log    # 查看消息监听日志
 
 ```bash
 ./patch.sh --monitor-uninstall   # 卸载消息监听（如安装过）
-./patch.sh --uninstall           # 卸载防撤回，恢复原始微信
+./patch.sh --uninstall           # 卸载防撤回，移除注入并重签名
 ```
+
+卸载会自动移除主程序里的 `LC_LOAD_DYLIB` 引用（否则 dylib 删除后微信无法启动），
+若存在 `~/wechat_backup_<版本>` 备份则一并还原。
 
 ---
 
