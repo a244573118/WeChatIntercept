@@ -1081,23 +1081,139 @@ do_uninstall() {
 
     kill_wechat
 
-    # 删除 dylib
-    rm -f "$DYLIB_DST" 2>/dev/null || true
+    # dylib 与主程序都在 root 属主目录下，必须提权，否则 Permission denied
+    echo "[INFO] 需要管理员权限，请输入密码..."
+    sudo -v || { echo "[ERROR] 无法获取管理员权限"; exit 1; }
+    ( while true; do sudo -n true 2>/dev/null; sleep 50; kill -0 $$ 2>/dev/null || exit; done ) &
+    SUDO_PID=$!
 
-    # 重新安装微信是最干净的卸载方式
-    echo "[INFO] 建议重新安装微信以完全恢复原始状态"
-    echo "[INFO] 或者删除 $DYLIB_DST 并重新签名"
+    sudo rm -f "$DYLIB_DST" 2>/dev/null || true
 
     if [ -f "$DYLIB_DST" ]; then
-        echo "[WARN] 无法删除 dylib，请手动重新安装微信"
-    else
-        resign_app 2>/dev/null || true
-        echo ""
-        echo "=============================="
-        echo " 已卸载（dylib 已删除）"
-        echo " 建议重新安装微信以彻底恢复"
-        echo "=============================="
+        kill $SUDO_PID 2>/dev/null || true
+        echo "[ERROR] 无法删除 dylib，请手动重装微信"
+        return 1
     fi
+
+    # 关键：dylib 删掉后，主程序里若仍留着指向它的 LC_LOAD_DYLIB，
+    # dyld 启动时会因为找不到文件而失败 —— 微信直接打不开。
+    # 所以必须从 Mach-O 里真正移除该 load command（不是简单改大小写）。
+    cp "$WECHAT_BIN" "$WORK_BIN_TMP" 2>/dev/null || sudo cp "$WECHAT_BIN" "$WORK_BIN_TMP"
+    chmod u+w "$WORK_BIN_TMP" 2>/dev/null || true
+
+    WORK_BIN="$WORK_BIN_TMP" python3 << 'UNINJECT_SCRIPT'
+import os, struct
+p = os.environ['WORK_BIN']
+name_tag = b'WeChatAntiRevoke'
+f = open(p, 'r+b')
+magic = struct.unpack('>I', f.read(4))[0]
+if magic != 0xCAFEBABE:
+    print('not fat'); raise SystemExit(0)
+n = struct.unpack('>I', f.read(4))[0]
+slices = []
+for i in range(n):
+    f.read(8)
+    off = struct.unpack('>I', f.read(4))[0]
+    sz = struct.unpack('>I', f.read(4))[0]
+    f.read(4)
+    slices.append((off, sz))
+
+removed = 0
+for so, sz in slices:
+    f.seek(so)
+    if struct.unpack('<I', f.read(4))[0] != 0xFEEDFACF:
+        continue
+    f.read(12)
+    ncmds_pos = f.tell()
+    ncmds = struct.unpack('<I', f.read(4))[0]
+    size_pos = f.tell()
+    sizeofcmds = struct.unpack('<I', f.read(4))[0]
+    f.read(8)
+
+    f.seek(so + 32)
+    target_pos = None
+    target_size = 0
+    for i in range(ncmds):
+        pos = f.tell()
+        cmd, cs = struct.unpack('<II', f.read(8))
+        if cmd == 0xC:
+            no = struct.unpack('<I', f.read(4))[0]
+            save = f.tell()
+            f.seek(pos + no)
+            nm = b''
+            while True:
+                b = f.read(1)
+                if b == b'\x00': break
+                nm += b
+            f.seek(save)
+            if name_tag in nm:
+                target_pos, target_size = pos, cs
+                break
+        f.seek(pos + cs)
+    if target_pos is None:
+        continue
+
+    # 把后面的 load command 整体前移，覆盖被删的那条
+    tail_start = target_pos + target_size
+    tail_end = so + 32 + sizeofcmds
+    tail = f.read(tail_end - tail_start) if tail_start < tail_end else b''
+    f.seek(target_pos)
+    if tail:
+        f.write(tail)
+    # 尾部补零
+    f.write(b'\x00' * target_size)
+    f.seek(ncmds_pos); f.write(struct.pack('<I', ncmds - 1))
+    f.seek(size_pos);  f.write(struct.pack('<I', sizeofcmds - target_size))
+    removed += 1
+
+print('removed %d' % removed)
+UNINJECT_SCRIPT
+
+    if ! otool -L "$WORK_BIN_TMP" | grep -q WeChatAntiRevoke; then
+        sudo cp "$WORK_BIN_TMP" "$WECHAT_BIN"
+        sudo chmod 755 "$WECHAT_BIN"
+        echo "[INFO] 已移除主程序中的 dylib 引用"
+    else
+        # 兜底：有备份就直接还原
+        if [ -f "$HOME/wechat_backup_4.1.13" ]; then
+            sudo cp "$HOME/wechat_backup_4.1.13" "$WECHAT_BIN"
+            sudo chmod 755 "$WECHAT_BIN"
+            echo "[INFO] 已从备份还原主程序"
+        else
+            kill $SUDO_PID 2>/dev/null || true
+            echo "[ERROR] 无法移除 dylib 引用且无备份，请重装微信"
+            rm -f "$WORK_BIN_TMP"
+            return 1
+        fi
+    fi
+    rm -f "$WORK_BIN_TMP"
+
+    # 不能复用 resign_app：它依赖 DYLIB_TMP / WORK_BIN_TMP，卸载时这两个文件不存在。
+    # 这里只需对主程序本身重签，去掉失效的 LC_LOAD_DYLIB 签名残留。
+    local ENT_FILE="/tmp/antirevoke_uninst.plist"
+    cat > "$ENT_FILE" << 'ENTITLEMENTS'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>
+ENTITLEMENTS
+
+    sudo codesign --force --deep --sign - "$WECHAT_APP" 2>/dev/null || true
+    sudo xattr -cr "$WECHAT_APP" 2>/dev/null || true
+    rm -f "$ENT_FILE"
+
+    kill $SUDO_PID 2>/dev/null || true
+
+    echo ""
+    echo "=============================="
+    echo " 已卸载"
+    echo "=============================="
+    echo ""
+    echo " 如仍有异常，重装微信可彻底恢复"
     echo ""
 }
 
