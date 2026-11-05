@@ -70,6 +70,7 @@ chmod +x patch.sh
 | `./patch.sh --monitor-status`    | 查看监听状态                           |
 | `./patch.sh --monitor-uninstall` | 卸载消息监听                           |
 | `./patch.sh --uninstall`         | 卸载防撤回                             |
+| `sudo ./restore.sh`              | 紧急回滚（备份整包覆盖，兜底用）        |
 | `./patch.sh --help`              | 查看帮助                               |
 
 ---
@@ -133,6 +134,12 @@ cat /tmp/wechat_monitor_daemon.log    # 查看消息监听日志
 
 卸载会自动移除主程序里的 `LC_LOAD_DYLIB` 引用（否则 dylib 删除后微信无法启动），
 若存在 `~/wechat_backup_<版本>` 备份则一并还原。
+
+如果卸载后微信仍无法启动，用备份整包回滚兜底：
+
+```bash
+sudo ./restore.sh
+```
 
 ---
 
