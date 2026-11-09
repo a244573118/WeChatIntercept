@@ -10,6 +10,8 @@ set -e
 WECHAT_APP="/Applications/WeChat.app"
 WECHAT_BIN="$WECHAT_APP/Contents/MacOS/WeChat"
 DYLIB_DST="$WECHAT_APP/Contents/Resources/WeChatAntiRevoke.dylib"
+DYLIB_TMP="/tmp/WeChatAntiRevoke.build.dylib"
+WORK_BIN_TMP="/tmp/WeChat.bin.work"
 DYLIB_INSTALL_NAME="@executable_path/../Resources/WeChatAntiRevoke.dylib"
 
 print_banner() {
@@ -66,24 +68,16 @@ kill_wechat() {
 }
 
 remove_provenance() {
-    echo "[INFO] 尝试解除系统文件保护..."
-    TMP_DIR=$(mktemp -d)
-    tar --no-xattrs -cf - -C /Applications WeChat.app | tar -xf - -C "$TMP_DIR/"
-    rm -rf "$WECHAT_APP"
-    mv "$TMP_DIR/WeChat.app" "$WECHAT_APP"
-    rm -rf "$TMP_DIR"
-
-    # 递归清除残留 xattr（best-effort）
+    echo "[INFO] 清除文件保护标记..."
+    # 不整包重建 App（tar -> rm -rf -> mv 链条一旦中断会把 App 删没，且缺 sudo 必失败）
     xattr -cr "$WECHAT_APP" 2>/dev/null || true
     sudo xattr -cr "$WECHAT_APP" 2>/dev/null || true
-
-    # 检查结果（仅警告，不阻断安装）
     if xattr "$WECHAT_APP" 2>/dev/null | grep -q "com.apple.provenance"; then
-        echo "[WARN] provenance 未能完全清除（macOS Sequoia 可能会自动重新附加）"
-        echo "[INFO] 将通过 entitlements 绕过此限制"
+        echo "[WARN] provenance 未能完全清除，将通过 entitlements 绕过"
     else
-        echo "[INFO] 文件保护已解除"
+        echo "[INFO] 文件保护标记已清除"
     fi
+    return 0
 }
 
 compile_dylib() {
@@ -94,6 +88,7 @@ compile_dylib() {
     rm -f "$SRC_FILE"
     cat > "$SRC_FILE" << 'HOOK_SOURCE'
 #import <Foundation/Foundation.h>
+#import <UserNotifications/UserNotifications.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach/mach.h>
@@ -124,12 +119,65 @@ static const int32_t  kRevokeType    = 0x2712;   // isRevokeMessage 比较的 Ms
 // 已知 build 的硬编码地址（特征码搜索失败时的兜底）
 static const uintptr_t k419_SlotVA_arm64   = 0x9301838;
 static const uintptr_t k4110_FuncVA_arm64  = 0x44FFE20;
+// 4.1.13 (269602) 实测入口；与特征码搜索结果一致，用于跳过全段扫描
+static const uintptr_t k4113_FuncVA_arm64  = 0x4661F5C;
+// 4.1.15 (270115) 实测入口：特征码唯一命中，前一条为 ret、后 20 字节即下一函数
+static const uintptr_t k4115_FuncVA_arm64  = 0x48CC078;
 static const uintptr_t k4110_FuncVA_x86_64 = 0x4B4E9A0;
 static const uintptr_t k419_FuncVA_x86_64  = 0x4AF08D0;
 
 // 当前登录用户 wxid，用于区分"自己撤回"vs"对方撤回"
 static char g_my_id[64] = {0};
 static _Bool g_my_id_loaded = 0;
+
+static _Bool looks_like_internal_id(const char *s) {
+    if (!s || s[0] == '\0') return 1;
+    while (*s == ' ' || *s == '\t' || *s == '"' || *s == '\'' || *s == '&') s++;
+    if (strncmp(s, "wxid_", 5) == 0) return 1;
+    if (strncmp(s, "gh_", 3) == 0) return 1;
+    size_t len = strlen(s);
+    if (len >= 9 && strcmp(s + len - 9, "@chatroom") == 0) return 1;
+    return 0;
+}
+
+static void copy_clean_name(char *dst, size_t dst_size, const char *src) {
+    if (!dst || dst_size == 0) return;
+    dst[0] = '\0';
+    if (!src) return;
+
+    while (*src == ' ' || *src == '\t' || *src == '"' || *src == '\'' || *src == '&') src++;
+    size_t len = strlen(src);
+    while (len > 0) {
+        unsigned char c = (unsigned char)src[len - 1];
+        if (c == ' ' || c == '\t' || c == '"' || c == '\'' || c == '\r' || c == '\n') {
+            len--;
+            continue;
+        }
+        break;
+    }
+    if (len == 0) return;
+    if (len >= dst_size) len = dst_size - 1;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+
+static const char *pick_display_name(char *buffer, size_t buffer_size,
+                                     const char *primary, const char *secondary, const char *fallback) {
+    if (primary && primary[0] != '\0' && !looks_like_internal_id(primary)) {
+        copy_clean_name(buffer, buffer_size, primary);
+        if (buffer[0] != '\0') return buffer;
+    }
+    if (secondary && secondary[0] != '\0' && !looks_like_internal_id(secondary)) {
+        copy_clean_name(buffer, buffer_size, secondary);
+        if (buffer[0] != '\0') return buffer;
+    }
+    if (fallback && fallback[0] != '\0' && !looks_like_internal_id(fallback)) {
+        copy_clean_name(buffer, buffer_size, fallback);
+        if (buffer[0] != '\0') return buffer;
+    }
+    copy_clean_name(buffer, buffer_size, "对方");
+    return buffer;
+}
 
 // 通过取 ~/Library/Containers/.../app_data/login/ 下最新修改的目录名判定
 static void load_my_user_id(void) {
@@ -179,27 +227,63 @@ static void load_my_user_id(void) {
 
 
 
-static void send_notification(const char *text) {
-    // osascript 对 " 和 \ 敏感，必须转义
-    char *escaped = (char *)malloc(1024);
-    if (!escaped) return;
-    int j = 0;
-    for (int i = 0; text[i] && j < 1022; i++) {
-        if (text[i] == '"' || text[i] == '\\') escaped[j++] = '\\';
-        escaped[j++] = text[i];
-    }
-    escaped[j] = '\0';
+static void send_notification_with_title(const char *title_text, const char *body_text) {
+    if (!body_text || body_text[0] == '\0') return;
 
-    dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        FILE *sf = fopen("/tmp/antirevoke_notify.scpt", "w");
-        if (sf) {
-            fprintf(sf, "display notification \"%s\" with title \"WeChatIntercept\"\n", escaped);
-            fclose(sf);
-            system("osascript /tmp/antirevoke_notify.scpt");
+    char *title_copy = strdup(title_text && title_text[0] != '\0' ? title_text : "WeChatIntercept");
+    char *body_copy = strdup(body_text);
+    if (!title_copy || !body_copy) {
+        free(title_copy);
+        free(body_copy);
+        return;
+    }
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            NSString *title = [NSString stringWithUTF8String:title_copy];
+            NSString *body = [NSString stringWithUTF8String:body_copy];
+            if (!body || [body length] == 0) {
+                free(title_copy);
+                free(body_copy);
+                return;
+            }
+
+            UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+            [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert |
+                                                     UNAuthorizationOptionBadge |
+                                                     UNAuthorizationOptionSound)
+                                  completionHandler:^(BOOL granted, NSError *error) {
+                if (!granted) {
+                    ARLOG("通知权限未授予");
+                }
+                if (error) {
+                    ARLOG("通知授权失败: %s", [[error localizedDescription] UTF8String]);
+                }
+            }];
+
+            UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+            content.title = title ?: @"WeChatIntercept";
+            content.body = body;
+
+            UNNotificationRequest *request =
+                [UNNotificationRequest requestWithIdentifier:[[NSUUID UUID] UUIDString]
+                                                     content:content
+                                                     trigger:nil];
+            [center addNotificationRequest:request withCompletionHandler:^(NSError *error) {
+                if (error) {
+                    ARLOG("通知投递失败: %s", [[error localizedDescription] UTF8String]);
+                }
+            }];
         }
-        free(escaped);
+        free(title_copy);
+        free(body_copy);
     });
 }
+
+static void send_notification(const char *text) {
+    send_notification_with_title("WeChatIntercept", text);
+}
+
 
 // 微信小版本升级 sender 偏移可能漂移；仅检查前 4 字节是否可打印 ASCII
 // 失效时静默放行（return 1），不影响微信内部撤回流程；阈值后弹一次催更新通知
@@ -273,114 +357,20 @@ _Bool hook_isRevokeMessage(void *msg) {
     // 对方撤回 → 阻止
     ARLOG("拦截: %.20s", sender);
 
-    // 从 msg+0x130 (ptr) / +0x138 (len) 读撤回 XML
-    char notify_text[256] = {0};
+    // 【安全版】不在 hook 点做任何指针解引用。
+    // 实测：4.1.13 里 +0x220 在 isRevokeMessage 被调用时仍是 0
+    // （微信是「确认是撤回」之后才填充该字段），所以在这里读它本就拿不到东西；
+    // 而盲目解引用未验证的指针会导致 EXC_BAD_ACCESS（已踩过）。
+    // 这里只用一个已确认安全的字段：+0x18 的发送者 wxid。
+    // pick_display_name：过滤 wxid_/gh_/@chatroom 这类内部 ID，
+    // 都不可用时回落到「对方」，避免通知里出现长串 wxid
+    char who_buf[128] = {0};
+    const char *who = pick_display_name(who_buf, sizeof(who_buf), NULL, NULL, sender);
 
-#if defined(__arm64__) || defined(__aarch64__)
-    uint64_t xml_ptr = *(uint64_t *)((uint8_t *)msg + 0x130);
-    uint64_t xml_len = *(uint64_t *)((uint8_t *)msg + 0x138);
-    if (xml_ptr > 0x100000000ULL && xml_len > 0 && xml_len < 4096) {
-        // CDATA 内容形如 "Macanzy" 撤回了一条消息
-        const char *xml_body = (const char *)xml_ptr;
-        const char *cs = strstr(xml_body, "<![CDATA[");
-        const char *ce = cs ? strstr(cs, "]]>") : NULL;
-        if (cs && ce) {
-            cs += 9;
-            size_t len = ce - cs;
-            if (len > 0 && len < sizeof(notify_text) - 1) {
-                memcpy(notify_text, cs, len);
-                notify_text[len] = '\0';
-            }
-        }
-    }
-#endif
+    char content[512] = {0};
+    snprintf(content, sizeof(content), "「%s」撤回了一条消息", who);
 
-    // 反查 lldb monitor 写入的消息缓存（/tmp/wechat_msg_cache.tsv）
-    char orig_content[512] = {0};
-    _Bool has_orig = 0;
-#if defined(__arm64__) || defined(__aarch64__)
-    if (xml_ptr > 0x100000000ULL && xml_len > 0 && xml_len < 4096) {
-        const char *xml_body = (const char *)xml_ptr;
-        const char *p = strstr(xml_body, "<newmsgid>");
-        uint64_t newmsgid = 0;
-        if (p) {
-            p += 10;
-            int digits = 0;
-            while (*p >= '0' && *p <= '9' && digits < 20) {
-                newmsgid = newmsgid * 10 + (uint64_t)(*p - '0');
-                p++; digits++;
-            }
-            if (digits == 0) newmsgid = 0;
-        }
-        if (newmsgid != 0) {
-            FILE *cf = fopen("/tmp/wechat_msg_cache.tsv", "r");
-            if (cf) {
-                char line[1024];
-                while (fgets(line, sizeof(line), cf)) {
-                    char *t1 = strchr(line, '\t');
-                    if (!t1) continue;
-                    *t1 = '\0';
-                    uint64_t row_svrid = 0;
-                    int d2 = 0;
-                    for (const char *q = line; *q >= '0' && *q <= '9' && d2 < 20; q++, d2++)
-                        row_svrid = row_svrid * 10 + (uint64_t)(*q - '0');
-                    if (d2 == 0 || row_svrid != newmsgid) continue;
-                    char *t2 = strchr(t1 + 1, '\t');
-                    if (!t2) continue;
-                    char *nl = strchr(t2 + 1, '\n');
-                    if (nl) *nl = '\0';
-                    strncpy(orig_content, t2 + 1, sizeof(orig_content) - 1);
-                    has_orig = (orig_content[0] != '\0');
-                }
-                fclose(cf);
-            }
-            ARLOG("撤回反查: svrid=%llu %s",
-                  (unsigned long long)newmsgid, has_orig ? "命中" : "未命中");
-        }
-    }
-#endif
-
-    // 非文本消息描述模板 → 占位符
-    if (has_orig) {
-        struct { const char *needle; const char *replace; } kReplaces[] = {
-            {"发了一张图片", "[图片]"}, {"发了一段视频", "[视频]"},
-            {"发了一个文件", "[文件]"}, {"发了一段语音", "[语音]"},
-            {"发了一条语音消息", "[语音]"}, {"发了一个表情", "[表情]"},
-            {"发了一个视频号", "[视频号]"}, {"发了一张名片", "[名片]"},
-            {"发了一个位置", "[位置]"}, {"发了一个红包", "[红包]"},
-            {"发了一个链接", "[链接]"}, {"发了一个小程序", "[小程序]"},
-            {NULL, NULL},
-        };
-        for (int i = 0; kReplaces[i].needle; i++) {
-            if (strstr(orig_content, kReplaces[i].needle)) {
-                strncpy(orig_content, kReplaces[i].replace, sizeof(orig_content) - 1);
-                break;
-            }
-        }
-    }
-
-    // 从 notify_text 抽纯昵称：剥 "撤回了" 后缀 + 首尾空格 + 英文双引号
-    char nick[128] = {0};
-    if (notify_text[0] != '\0') {
-        const char *p = strstr(notify_text, "撤回了");
-        if (p && p > notify_text) {
-            const char *start = notify_text;
-            size_t nlen = (size_t)(p - notify_text);
-            while (nlen > 0 && start[nlen - 1] == ' ') nlen--;
-            while (nlen > 0 && *start == ' ') { start++; nlen--; }
-            if (nlen >= 2 && start[0] == '"' && start[nlen - 1] == '"') { start++; nlen -= 2; }
-            if (nlen > 0 && nlen < sizeof(nick)) { memcpy(nick, start, nlen); nick[nlen] = '\0'; }
-        }
-    }
-    const char *who = (nick[0] != '\0') ? nick : sender;
-
-    char content[768] = {0};
-    if (has_orig) {
-        snprintf(content, sizeof(content), "拦截到「%s」撤回了一条消息：%s", who, orig_content);
-    } else {
-        snprintf(content, sizeof(content), "拦截到「%s」撤回了一条消息", who);
-    }
-
+    ARLOG("提示: %s", content);
     send_notification(content);
 
     return 0;
@@ -491,7 +481,7 @@ static uintptr_t scan_isRevokeMessage_x86_64(uintptr_t text_start, size_t text_s
     return 0;
 }
 
-static const char *kKnownBuilds[] = { "268602", "268824", NULL };
+static const char *kKnownBuilds[] = { "268602", "268824", "269602", "270115", NULL };
 
 static _Bool is_known_build(const char *build) {
     if (!build) return 0;
@@ -643,15 +633,18 @@ static void hook_init(void) {
 #if defined(__arm64__) || defined(__aarch64__)
         // 三级查找：硬编码快速路径 → 特征码搜索 → 4.1.9 slot fallback
         uintptr_t func_addr = 0;
-        uintptr_t func_4110 = slide + k4110_FuncVA_arm64;
-        uint32_t head_insn = *(volatile uint32_t *)func_4110;
-
-        if (head_insn == 0xB9400C08u) {
-            uint32_t *p = (uint32_t *)func_4110;
+        // 依次尝试已知版本的硬编码入口，任一匹配即可跳过全段特征码扫描。
+        // 都失配时回落到特征码搜索（小版本升级后的常规路径）。
+        const uintptr_t kFastCandidates[] = { k4115_FuncVA_arm64, k4113_FuncVA_arm64, k4110_FuncVA_arm64 };
+        for (size_t ci = 0; ci < sizeof(kFastCandidates)/sizeof(kFastCandidates[0]); ci++) {
+            uintptr_t cand = slide + kFastCandidates[ci];
+            if (*(volatile uint32_t *)cand != 0xB9400C08u) continue;
+            uint32_t *p = (uint32_t *)cand;
             if (p[1] == 0x5284E249u && p[2] == 0x6B09011Fu &&
                 p[3] == 0x1A9F17E0u && p[4] == 0xD65F03C0u) {
-                func_addr = func_4110;
+                func_addr = cand;
                 ARLOG("快速路径命中: 0x%lx", (unsigned long)func_addr);
+                break;
             }
         }
 
@@ -659,9 +652,18 @@ static void hook_init(void) {
             ARLOG("快速路径未命中，开始特征码搜索...");
             uintptr_t found = scan_isRevokeMessage_arm64(text_start, text_size);
             if (found) {
-                func_addr = found;
-                ARLOG("特征码搜索找到: 0x%lx (offset 0x%lx)",
-                      (unsigned long)func_addr, (unsigned long)(func_addr - slide));
+                // 特征码是 5 条指令整串（ldr w8,[x0,#0xC]; mov w9,#0x2712; cmp; cset; ret），
+                // 命中地址即函数入口，不需回退。这里只加一道自校验：
+                // 入口首指令必须是 ldr w8,[x0,#0xC]，次条必须是 mov w9,#0x2712。
+                if (*(volatile uint32_t *)found != 0xB9400C08u ||
+                    *(volatile uint32_t *)(found + 4) != 0x5284E249u) {
+                    ARLOG("WARN: 特征码入口校验失败 (%08x)，放弃 hook",
+                          *(volatile uint32_t *)found);
+                } else {
+                    func_addr = found;
+                    ARLOG("特征码搜索找到: 0x%lx (offset 0x%lx)",
+                          (unsigned long)func_addr, (unsigned long)(func_addr - slide));
+                }
             }
         }
 
@@ -724,14 +726,15 @@ static void hook_init(void) {
 }
 HOOK_SOURCE
 
-    clang -arch arm64 -arch x86_64 -shared -framework Foundation \
-        -o "$DYLIB_DST" \
+    clang -arch arm64 -arch x86_64 -shared \
+        -framework Foundation -framework UserNotifications \
+        -o "$DYLIB_TMP" \
         -install_name "$DYLIB_INSTALL_NAME" \
         "$SRC_FILE" 2>&1
 
     rm -f "$SRC_FILE"
 
-    if [ ! -f "$DYLIB_DST" ]; then
+    if [ ! -f "$DYLIB_TMP" ]; then
         echo "[ERROR] 编译失败"
         exit 1
     fi
@@ -741,10 +744,14 @@ HOOK_SOURCE
 inject_dylib() {
     echo "[INFO] 注入动态库到微信..."
 
-    python3 << 'INJECT_SCRIPT'
-import struct
+    # 在 /tmp 副本上注入：/Applications/.../MacOS 属 root:wheel，不可直接创建/写入
+    cp "$WECHAT_BIN" "$WORK_BIN_TMP" || { echo "[ERROR] 复制主程序失败"; return 1; }
+    chmod u+w "$WORK_BIN_TMP"
 
-wechat_path = '/Applications/WeChat.app/Contents/MacOS/WeChat'
+    WORK_BIN="$WORK_BIN_TMP" python3 << 'INJECT_SCRIPT'
+import os, struct
+
+wechat_path = os.environ['WORK_BIN']
 dylib_name = b'@executable_path/../Resources/WeChatAntiRevoke.dylib\x00'
 while len(dylib_name) % 4 != 0:
     dylib_name += b'\x00'
@@ -848,15 +855,29 @@ resign_app() {
 </plist>
 ENTITLEMENTS
 
-    # 1. 签名 dylib（adhoc）
-    codesign --force --sign - "$DYLIB_DST" 2>/dev/null
+    # 一次性提权：落 dylib + 换主程序 + 三步签名
+    local INSTALL_SH="/tmp/antirevoke_install.sh"
+    cat > "$INSTALL_SH" << INSTALL_SCRIPT
+#!/bin/bash
+set -e
+/usr/bin/ditto "$DYLIB_TMP" "$DYLIB_DST"
+/bin/cp "$WORK_BIN_TMP" "$WECHAT_BIN"
+/bin/chmod 755 "$WECHAT_BIN"
+/usr/bin/xattr -c "$WECHAT_BIN" 2>/dev/null || true
+/usr/bin/codesign --force --sign - "$DYLIB_DST"
+/usr/bin/codesign --force --deep --sign - "$WECHAT_APP" 2>/dev/null || true
+/usr/bin/codesign --force --sign - --entitlements "$ENT_FILE" "$WECHAT_BIN"
+/usr/bin/xattr -cr "$WECHAT_APP" 2>/dev/null || true
+INSTALL_SCRIPT
+    chmod +x "$INSTALL_SH"
 
-    # 2. 整体 deep 签名（先处理所有子组件）
-    codesign --force --deep --sign - "$WECHAT_APP" 2>/dev/null
-
-    # 3. 最后单独给主程序签名并注入 entitlements（覆盖 deep 签名的结果）
-    #    这样 entitlements 不会被后续操作覆盖
-    codesign --force --sign - --entitlements "$ENT_FILE" "$WECHAT_BIN" 2>/dev/null
+    echo "[INFO] 需要管理员权限写入 /Applications 并重签名..."
+    if ! sudo bash "$INSTALL_SH"; then
+        echo "[ERROR] 提权安装失败"
+        rm -f "$INSTALL_SH"
+        return 1
+    fi
+    rm -f "$INSTALL_SH"
 
     # 清除 xattr（best-effort）
     xattr -cr "$WECHAT_APP" 2>/dev/null || true
@@ -976,14 +997,18 @@ do_install() {
 
     kill_wechat
 
-    # 无条件清除 provenance（即使 .app 顶层无标记，内层文件也可能有）
-    # 重打包是幂等操作，不会造成损坏
+    echo "[INFO] 需要管理员权限，请输入一次密码..."
+    sudo -v || { echo "[ERROR] 无法获取管理员权限"; exit 1; }
+    ( while true; do sudo -n true 2>/dev/null; sleep 50; kill -0 $$ 2>/dev/null || exit; done ) &
+    SUDO_PID=$!
+
     remove_provenance
-    rm -f "$DYLIB_DST" 2>/dev/null || true
+    sudo rm -f "$DYLIB_DST" 2>/dev/null || true
 
     compile_dylib
-    inject_dylib
-    resign_app
+    inject_dylib || { kill $SUDO_PID 2>/dev/null; echo "[ERROR] 注入失败，未改动原 App"; exit 1; }
+    resign_app || { kill $SUDO_PID 2>/dev/null; echo "[ERROR] 签名失败"; exit 1; }
+    kill $SUDO_PID 2>/dev/null || true
     verify_install
 
 
@@ -1008,8 +1033,20 @@ do_debug() {
     kill_wechat
     remove_provenance
 
+    # 提权：dylib 和签名都在 /Applications（root:wheel）下，
+    # 不提权的话 rm/codesign 会静默失败（原来没有 sudo 但加了 || true，用户看不出问题）
+    echo "[INFO] 需要管理员权限，请输入密码..."
+    sudo -v || { echo "[ERROR] 无法获取管理员权限"; exit 1; }
+    ( while true; do sudo -n true 2>/dev/null; sleep 50; kill -0 $$ 2>/dev/null || exit; done ) &
+    SUDO_PID=$!
+
     # 删除已有的 hook dylib（确保无 hook）
-    rm -f "$DYLIB_DST" 2>/dev/null || true
+    sudo rm -f "$DYLIB_DST" 2>/dev/null || true
+    if [ -f "$DYLIB_DST" ]; then
+        kill $SUDO_PID 2>/dev/null || true
+        echo "[ERROR] 无法删除已有 dylib，请先运行 ./patch.sh --uninstall"
+        exit 1
+    fi
 
     # 签名（带 get-task-allow，允许 lldb attach）
     echo "[INFO] 重签名（注入调试 entitlements）..."
@@ -1029,10 +1066,22 @@ do_debug() {
 </plist>
 ENTITLEMENTS
 
-    codesign --force --deep --sign - "$WECHAT_APP" 2>/dev/null
-    codesign --force --sign - --entitlements "$ENT_FILE" "$WECHAT_BIN" 2>/dev/null
-    xattr -cr "$WECHAT_APP" 2>/dev/null || true
+    if ! sudo codesign --force --deep --sign - "$WECHAT_APP"; then
+        kill $SUDO_PID 2>/dev/null || true
+        rm -f "$ENT_FILE"
+        echo "[ERROR] 重签名失败"
+        exit 1
+    fi
+    sudo codesign --force --sign - --entitlements "$ENT_FILE" "$WECHAT_BIN"
+    sudo xattr -cr "$WECHAT_APP" 2>/dev/null || true
     rm -f "$ENT_FILE"
+    kill $SUDO_PID 2>/dev/null || true
+
+    # 校验 entitlements 真的写进去了
+    if ! codesign -d --entitlements - "$WECHAT_BIN" 2>&1 | grep -q "get-task-allow"; then
+        echo "[ERROR] get-task-allow 未生效，lldb 无法 attach"
+        exit 1
+    fi
 
     echo "[INFO] 启动微信..."
     open "$WECHAT_APP"
@@ -1063,23 +1112,139 @@ do_uninstall() {
 
     kill_wechat
 
-    # 删除 dylib
-    rm -f "$DYLIB_DST" 2>/dev/null || true
+    # dylib 与主程序都在 root 属主目录下，必须提权，否则 Permission denied
+    echo "[INFO] 需要管理员权限，请输入密码..."
+    sudo -v || { echo "[ERROR] 无法获取管理员权限"; exit 1; }
+    ( while true; do sudo -n true 2>/dev/null; sleep 50; kill -0 $$ 2>/dev/null || exit; done ) &
+    SUDO_PID=$!
 
-    # 重新安装微信是最干净的卸载方式
-    echo "[INFO] 建议重新安装微信以完全恢复原始状态"
-    echo "[INFO] 或者删除 $DYLIB_DST 并重新签名"
+    sudo rm -f "$DYLIB_DST" 2>/dev/null || true
 
     if [ -f "$DYLIB_DST" ]; then
-        echo "[WARN] 无法删除 dylib，请手动重新安装微信"
-    else
-        resign_app 2>/dev/null || true
-        echo ""
-        echo "=============================="
-        echo " 已卸载（dylib 已删除）"
-        echo " 建议重新安装微信以彻底恢复"
-        echo "=============================="
+        kill $SUDO_PID 2>/dev/null || true
+        echo "[ERROR] 无法删除 dylib，请手动重装微信"
+        return 1
     fi
+
+    # 关键：dylib 删掉后，主程序里若仍留着指向它的 LC_LOAD_DYLIB，
+    # dyld 启动时会因为找不到文件而失败 —— 微信直接打不开。
+    # 所以必须从 Mach-O 里真正移除该 load command（不是简单改大小写）。
+    cp "$WECHAT_BIN" "$WORK_BIN_TMP" 2>/dev/null || sudo cp "$WECHAT_BIN" "$WORK_BIN_TMP"
+    chmod u+w "$WORK_BIN_TMP" 2>/dev/null || true
+
+    WORK_BIN="$WORK_BIN_TMP" python3 << 'UNINJECT_SCRIPT'
+import os, struct
+p = os.environ['WORK_BIN']
+name_tag = b'WeChatAntiRevoke'
+f = open(p, 'r+b')
+magic = struct.unpack('>I', f.read(4))[0]
+if magic != 0xCAFEBABE:
+    print('not fat'); raise SystemExit(0)
+n = struct.unpack('>I', f.read(4))[0]
+slices = []
+for i in range(n):
+    f.read(8)
+    off = struct.unpack('>I', f.read(4))[0]
+    sz = struct.unpack('>I', f.read(4))[0]
+    f.read(4)
+    slices.append((off, sz))
+
+removed = 0
+for so, sz in slices:
+    f.seek(so)
+    if struct.unpack('<I', f.read(4))[0] != 0xFEEDFACF:
+        continue
+    f.read(12)
+    ncmds_pos = f.tell()
+    ncmds = struct.unpack('<I', f.read(4))[0]
+    size_pos = f.tell()
+    sizeofcmds = struct.unpack('<I', f.read(4))[0]
+    f.read(8)
+
+    f.seek(so + 32)
+    target_pos = None
+    target_size = 0
+    for i in range(ncmds):
+        pos = f.tell()
+        cmd, cs = struct.unpack('<II', f.read(8))
+        if cmd == 0xC:
+            no = struct.unpack('<I', f.read(4))[0]
+            save = f.tell()
+            f.seek(pos + no)
+            nm = b''
+            while True:
+                b = f.read(1)
+                if b == b'\x00': break
+                nm += b
+            f.seek(save)
+            if name_tag in nm:
+                target_pos, target_size = pos, cs
+                break
+        f.seek(pos + cs)
+    if target_pos is None:
+        continue
+
+    # 把后面的 load command 整体前移，覆盖被删的那条
+    tail_start = target_pos + target_size
+    tail_end = so + 32 + sizeofcmds
+    tail = f.read(tail_end - tail_start) if tail_start < tail_end else b''
+    f.seek(target_pos)
+    if tail:
+        f.write(tail)
+    # 尾部补零
+    f.write(b'\x00' * target_size)
+    f.seek(ncmds_pos); f.write(struct.pack('<I', ncmds - 1))
+    f.seek(size_pos);  f.write(struct.pack('<I', sizeofcmds - target_size))
+    removed += 1
+
+print('removed %d' % removed)
+UNINJECT_SCRIPT
+
+    if ! otool -L "$WORK_BIN_TMP" | grep -q WeChatAntiRevoke; then
+        sudo cp "$WORK_BIN_TMP" "$WECHAT_BIN"
+        sudo chmod 755 "$WECHAT_BIN"
+        echo "[INFO] 已移除主程序中的 dylib 引用"
+    else
+        # 兜底：有备份就直接还原
+        if [ -f "$HOME/wechat_backup_4.1.13" ]; then
+            sudo cp "$HOME/wechat_backup_4.1.13" "$WECHAT_BIN"
+            sudo chmod 755 "$WECHAT_BIN"
+            echo "[INFO] 已从备份还原主程序"
+        else
+            kill $SUDO_PID 2>/dev/null || true
+            echo "[ERROR] 无法移除 dylib 引用且无备份，请重装微信"
+            rm -f "$WORK_BIN_TMP"
+            return 1
+        fi
+    fi
+    rm -f "$WORK_BIN_TMP"
+
+    # 不能复用 resign_app：它依赖 DYLIB_TMP / WORK_BIN_TMP，卸载时这两个文件不存在。
+    # 这里只需对主程序本身重签，去掉失效的 LC_LOAD_DYLIB 签名残留。
+    local ENT_FILE="/tmp/antirevoke_uninst.plist"
+    cat > "$ENT_FILE" << 'ENTITLEMENTS'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>
+ENTITLEMENTS
+
+    sudo codesign --force --deep --sign - "$WECHAT_APP" 2>/dev/null || true
+    sudo xattr -cr "$WECHAT_APP" 2>/dev/null || true
+    rm -f "$ENT_FILE"
+
+    kill $SUDO_PID 2>/dev/null || true
+
+    echo ""
+    echo "=============================="
+    echo " 已卸载"
+    echo "=============================="
+    echo ""
+    echo " 如仍有异常，重装微信可彻底恢复"
     echo ""
 }
 
@@ -1104,8 +1269,11 @@ import lldb
 import struct
 import datetime
 
-# CMessageWrap 虚方法（257712）特征码（4.1.10 实测）
-# PREFIX 4条 + 通配 bl(4字节) + SUFFIX 1条
+# CMessageWrap 虚方法（257712）特征码
+# 4.1.10 实测原值: PREFIX 4条 + 通配 bl(4字节) + SUFFIX 1条
+# 4.1.13 复验: 同一组 PREFIX/SUFFIX 仍唯一命中（严格匹配仅 1 处），
+#             但命中地址漂到 0x48df058，且其后的构造函数 0x48df084 才持有字段布局。
+#             偏移 0x28~0x50 经构造函数清零指令交叉验证未漂移。
 PATTERN_PREFIX = bytes.fromhex("f44fbea9" "fd7b01a9" "fd430091" "f30301aa")
 PATTERN_SUFFIX = bytes.fromhex("683a40f9")
 PATTERN_GAP = 4
